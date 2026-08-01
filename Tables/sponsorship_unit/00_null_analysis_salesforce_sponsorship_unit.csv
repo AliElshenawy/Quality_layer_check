@@ -1,0 +1,26 @@
+﻿source_table,total_rows,distinct_ids,ordinal,column_name,data_type,null_empty_count,null_pct,distinct_values,flag
+raw.salesforce_sponsorship_unit,1291058,1291058,1,Id,nvarchar,0,.00%,1291058,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,2,IsDeleted,nvarchar,0,.00%,1,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,3,Name,nvarchar,0,.00%,1291058,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,4,CurrencyIsoCode,nvarchar,0,.00%,7,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,5,CreatedDate,nvarchar,0,.00%,7370,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,6,CreatedById,nvarchar,0,.00%,4,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,7,LastModifiedDate,nvarchar,0,.00%,10628,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,8,LastModifiedById,nvarchar,0,.00%,19,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,9,SystemModstamp,nvarchar,0,.00%,10628,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,10,LastActivityDate,nvarchar,1291058,100.00%,0,🔴 high
+raw.salesforce_sponsorship_unit,1291058,1291058,11,Sponsorship__c,nvarchar,0,.00%,101491,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,12,GAU_Allocation__c,nvarchar,0,.00%,1016008,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,13,Payment_Period__c,nvarchar,0,.00%,100,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,14,Donation_Date__c,nvarchar,41834,3.24%,987,🟡 low
+raw.salesforce_sponsorship_unit,1291058,1291058,15,OrphanAccountID__c,nvarchar,1291058,100.00%,0,🔴 high
+raw.salesforce_sponsorship_unit,1291058,1291058,16,Orphan_Id__c,nvarchar,0,.00%,69054,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,17,GAU_Name__c,nvarchar,0,.00%,8,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,18,Deferred_Amount_in_GBP__c,nvarchar,1202297,93.12%,496,🔴 high
+raw.salesforce_sponsorship_unit,1291058,1291058,19,Deferred_Amount_in_LC__c,nvarchar,1202300,93.13%,558,🔴 high
+raw.salesforce_sponsorship_unit,1291058,1291058,20,Local_Currency_Of_Deferred_Funds__c,nvarchar,1197062,92.72%,13,🔴 high
+raw.salesforce_sponsorship_unit,1291058,1291058,21,Orphan_Account_Name__c,nvarchar,0,.00%,17,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,22,Casesafe_Id__c,nvarchar,0,.00%,1291058,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,23,_etl_loaded_at_utc,datetime2,0,.00%,1,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,24,_etl_source,nvarchar,0,.00%,1,✅ clean
+raw.salesforce_sponsorship_unit,1291058,1291058,25,_etl_source_object,nvarchar,0,.00%,1,✅ clean
