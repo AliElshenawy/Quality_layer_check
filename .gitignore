@@ -1,0 +1,18 @@
+# Secrets — NEVER commit real credentials
+scripts/config.json
+shared files/config.json
+shared files/Creds.txt
+**/config.local.json
+**/Creds.txt
+*.env
+
+# Local run output
+exports/
+*.log
+*.tmp
+*.bak
+
+# Python / editor junk
+__pycache__/
+*.pyc
+~$*
