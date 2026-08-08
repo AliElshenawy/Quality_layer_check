@@ -1,0 +1,19 @@
+source_table,total_rows,distinct_ids,ordinal,column_name,data_type,null_empty_count,null_pct,distinct_values,flag,dq_priority
+raw.salesforce_contact,1901058,1901058,1,Id,nvarchar,0,.00%,1901058,✅ clean,PK / required
+raw.salesforce_contact,1901058,1901058,2,IsDeleted,nvarchar,0,.00%,2,✅ clean,dedup filter (32 rows =true)
+raw.salesforce_contact,1901058,1901058,3,SystemModstamp,nvarchar,0,.00%,1901058,✅ clean,watermark / dedup order
+raw.salesforce_contact,1901058,1901058,4,LastName,nvarchar,183,.01%,363619,🟡 low,required (all channels)
+raw.salesforce_contact,1901058,1901058,5,RecordTypeId,nvarchar,16,.00%,5,🟡 low,required (bulk upload)
+raw.salesforce_contact,1901058,1901058,6,Email,nvarchar,161517,8.50%,1551956,🟠 medium,required (Email_Field_is_Significant) + primary match key
+raw.salesforce_contact,1901058,1901058,7,MailingStreet,nvarchar,67605,3.56%,1209930,🟡 low,address-required rule
+raw.salesforce_contact,1901058,1901058,8,MailingCity,nvarchar,143107,7.53%,75189,🟠 medium,address-required rule
+raw.salesforce_contact,1901058,1901058,9,MailingPostalCode,nvarchar,117499,6.18%,356062,🟠 medium,address-required rule
+raw.salesforce_contact,1901058,1901058,10,MailingCountry,nvarchar,49163,2.59%,213,🟡 low,address-required rule
+raw.salesforce_contact,1901058,1901058,11,MailingState,nvarchar,1683298,88.55%,332,🔴 high,listed in client rule but 88.55% empty (see note)
+raw.salesforce_contact,1901058,1901058,12,External_Id__c,nvarchar,92584,4.87%,1808466,🟡 low,matching key (Email_+_RegionalOffice)
+raw.salesforce_contact,1901058,1901058,13,Regional_Office_Code__c,nvarchar,73,.00%,11,🟡 low,matching key component
+raw.salesforce_contact,1901058,1901058,14,Gift_Aid_Status__c,nvarchar,198606,10.45%,3,🟠 medium,client rule Yes/No only (Unspecified=352838)
+raw.salesforce_contact,1901058,1901058,15,FirstName,nvarchar,10435,.55%,223601,🟡 low,required (web/crowdfunding)
+raw.salesforce_contact,1901058,1901058,16,Phone,nvarchar,535235,28.15%,1182265,🟠 medium,required (web/crowdfunding)
+raw.salesforce_contact,1901058,1901058,17,MobilePhone,nvarchar,1567839,82.47%,273828,🔴 high,My Jannah account requirement
+raw.salesforce_contact,1901058,1901058,18,Is_Donor__c,nvarchar,0,.00%,2,✅ clean,donor classification flag

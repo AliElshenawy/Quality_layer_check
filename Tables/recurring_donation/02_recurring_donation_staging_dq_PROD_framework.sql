@@ -69,125 +69,18 @@ GO
 SET NOCOUNT ON;
 
 -- ============================================================================
--- STEP 1: REBUILD STAGING (30 COLUMNS)
+-- STEP 1: BUILD STAGING (INCREMENTAL — no DROP)
+--   Persistent table + incremental builder are the canonical files:
+--     database/staging/recurring_donation_latest_table.sql (IF NOT EXISTS + Id18)
+--     database/staging/recurring_donation_latest_SP.sql     (staging.refresh_recurring_donation_latest)
+--   Deploy those first (via _deploy.sql); this step only refreshes incrementally.
 -- ============================================================================
-PRINT '========== STEP 1: REBUILD STAGING (30 COLS) ==========';
+PRINT '========== STEP 1: BUILD STAGING (incremental) ==========';
 
-IF OBJECT_ID(N'[staging].[recurring_donation_latest]', N'U') IS NOT NULL
-    DROP TABLE [staging].[recurring_donation_latest];
-
-CREATE TABLE [staging].[recurring_donation_latest]
-(
-    -- dedup
-    [row_number]                           BIGINT,
-    -- identity / system
-    [Id]                                   NVARCHAR(MAX),
-    [IsDeleted]                            NVARCHAR(MAX),
-    [Name]                                 NVARCHAR(MAX),
-    [CurrencyIsoCode]                      NVARCHAR(MAX),
-    -- donor
-    [npe03__Contact__c]                    NVARCHAR(MAX),
-    [npe03__Organization__c]               NVARCHAR(MAX),
-    -- financial
-    [npe03__Amount__c]                     NVARCHAR(MAX),
-    [npe03__Installment_Amount__c]         NVARCHAR(MAX),
-    [npe03__Paid_Amount__c]                NVARCHAR(MAX),
-    [Total_Donation_Amount__c]             NVARCHAR(MAX),
-    -- status / lifecycle
-    [npsp__Status__c]                      NVARCHAR(MAX),
-    [npsp__RecurringType__c]               NVARCHAR(MAX),
-    [npsp__StartDate__c]                   NVARCHAR(MAX),
-    [npsp__EndDate__c]                     NVARCHAR(MAX),
-    [npsp__ClosedReason__c]                NVARCHAR(MAX),
-    -- schedule
-    [npe03__Installment_Period__c]         NVARCHAR(MAX),
-    [npsp__Day_of_Month__c]                NVARCHAR(MAX),
-    [npe03__Next_Payment_Date__c]          NVARCHAR(MAX),
-    -- classification
-    [Donation_Type__c]                     NVARCHAR(MAX),
-    [npsp__PaymentMethod__c]               NVARCHAR(MAX),
-    [Regional_Office_Code__c]              NVARCHAR(MAX),
-    -- reference
-    [npe03__Recurring_Donation_Campaign__c] NVARCHAR(MAX),
-    -- monitoring
-    [Number_of_Failed_Payments__c]         NVARCHAR(MAX),
-    -- ETL metadata
-    [SystemModstamp]                       NVARCHAR(MAX),
-    [_etl_source]                          NVARCHAR(MAX),
-    [_etl_source_object]                   NVARCHAR(MAX),
-    [_etl_loaded_at_utc]                   NVARCHAR(MAX),
-    [staging_is_duplicate]                 BIT,
-    [staging_duplicate_count]              INT,
-    [staging_created_at]                   DATETIME
-);
-GO
-
-WITH dedup AS
-(
-    SELECT
-        [Id], [IsDeleted], [Name], [CurrencyIsoCode],
-        [npe03__Contact__c], [npe03__Organization__c],
-        [npe03__Amount__c], [npe03__Installment_Amount__c], [npe03__Paid_Amount__c],
-        [Total_Donation_Amount__c],
-        [npsp__Status__c], [npsp__RecurringType__c],
-        [npsp__StartDate__c], [npsp__EndDate__c], [npsp__ClosedReason__c],
-        [npe03__Installment_Period__c], [npsp__Day_of_Month__c], [npe03__Next_Payment_Date__c],
-        [Donation_Type__c], [npsp__PaymentMethod__c], [Regional_Office_Code__c],
-        [npe03__Recurring_Donation_Campaign__c],
-        [Number_of_Failed_Payments__c],
-        [SystemModstamp], [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-        ROW_NUMBER() OVER
-        (
-            PARTITION BY CONVERT(VARCHAR(18), [Id])
-            ORDER BY COALESCE
-            (
-                TRY_CONVERT(DATETIME2(7), [SystemModstamp], 127),
-                TRY_CONVERT(DATETIME2(7), [SystemModstamp])
-            ) DESC
-        ) AS rn,
-        COUNT(*) OVER (PARTITION BY [Id]) AS dup_cnt
-    FROM [raw].[salesforce_recurring_donation]
-    WHERE [Id] IS NOT NULL
-)
-INSERT INTO [staging].[recurring_donation_latest]
-(
-    [row_number],
-    [Id], [IsDeleted], [Name], [CurrencyIsoCode],
-    [npe03__Contact__c], [npe03__Organization__c],
-    [npe03__Amount__c], [npe03__Installment_Amount__c], [npe03__Paid_Amount__c],
-    [Total_Donation_Amount__c],
-    [npsp__Status__c], [npsp__RecurringType__c],
-    [npsp__StartDate__c], [npsp__EndDate__c], [npsp__ClosedReason__c],
-    [npe03__Installment_Period__c], [npsp__Day_of_Month__c], [npe03__Next_Payment_Date__c],
-    [Donation_Type__c], [npsp__PaymentMethod__c], [Regional_Office_Code__c],
-    [npe03__Recurring_Donation_Campaign__c],
-    [Number_of_Failed_Payments__c],
-    [SystemModstamp], [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-    [staging_is_duplicate], [staging_duplicate_count], [staging_created_at]
-)
-SELECT
-    rn,
-    [Id], [IsDeleted], [Name], [CurrencyIsoCode],
-    [npe03__Contact__c], [npe03__Organization__c],
-    [npe03__Amount__c], [npe03__Installment_Amount__c], [npe03__Paid_Amount__c],
-    [Total_Donation_Amount__c],
-    [npsp__Status__c], [npsp__RecurringType__c],
-    [npsp__StartDate__c], [npsp__EndDate__c], [npsp__ClosedReason__c],
-    [npe03__Installment_Period__c], [npsp__Day_of_Month__c], [npe03__Next_Payment_Date__c],
-    [Donation_Type__c], [npsp__PaymentMethod__c], [Regional_Office_Code__c],
-    [npe03__Recurring_Donation_Campaign__c],
-    [Number_of_Failed_Payments__c],
-    [SystemModstamp], [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-    CASE WHEN dup_cnt > 1 THEN 1 ELSE 0 END,
-    CASE WHEN dup_cnt > 1 THEN dup_cnt ELSE 0 END,
-    GETUTCDATE()
-FROM dedup
-WHERE rn = 1
-  AND COALESCE(LOWER(LTRIM(RTRIM(CONVERT(NVARCHAR(20), [IsDeleted])))), N'false')
-      NOT IN (N'true', N'1', N'yes', N'y');
+EXEC staging.refresh_recurring_donation_latest;   -- add @FullRebuild = 1 only for a deliberate reset
 
 DECLARE @stg_cnt BIGINT = (SELECT COUNT(*) FROM [staging].[recurring_donation_latest]);
-PRINT 'Staging rows loaded: ' + CAST(@stg_cnt AS VARCHAR(30));
+PRINT 'Staging rows: ' + CAST(@stg_cnt AS VARCHAR(30));
 GO
 
 -- ============================================================================

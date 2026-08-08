@@ -24,9 +24,9 @@ Rule check types (must match dq.dq_rule_catalog):
               (CAM-004 Status / CAM-006 Currency report-only: no assumed value lists)
 
 Dependency / governance notes:
-  CAM-016 (Region controlled list) is governed by staging.campaign_region_allowed_values.
-          The rule SQL is GUARDED: it only flags when that table has at least one
-          is_allowed=1 row, so an empty approved-list produces 0 (not false positives).
+  CAM-016 (Region) is REPORT-ONLY listing: it surfaces distinct populated Region__c
+          values for review. No controlled-list table is used (staging.campaign_region_allowed_values
+          was removed); group dq exceptions by exception_value to see the distinct regions.
   CAM-017 (IsDeleted VALID_BOOLEAN) runs on staging.campaign_latest, which already
           excludes deleted rows, so it is expected to be ~0 here. The raw-layer
           IsDeleted token check remains a separate concern.
@@ -61,95 +61,18 @@ GO
 SET NOCOUNT ON;
 
 -- ============================================================================
--- STEP 1: REBUILD STAGING (29 COLUMNS)
+-- STEP 1: BUILD STAGING (INCREMENTAL — no DROP)
+--   The persistent table + incremental builder are the canonical files:
+--     database/staging/campaign_latest_table.sql  (IF NOT EXISTS table + Id18)
+--     database/staging/campaign_latest_SP.sql      (staging.refresh_campaign_latest)
+--   Deploy those first (via _deploy.sql); this step only refreshes incrementally.
 -- ============================================================================
-PRINT '========== STEP 1: REBUILD STAGING (29 COLS) ==========';
+PRINT '========== STEP 1: BUILD STAGING (incremental) ==========';
 
-IF OBJECT_ID(N'[staging].[campaign_latest]', N'U') IS NOT NULL
-    DROP TABLE [staging].[campaign_latest];
-
-CREATE TABLE [staging].[campaign_latest]
-(
-    [row_number]                        BIGINT,
-    [Id]                                NVARCHAR(MAX),
-    [ParentId]                          NVARCHAR(MAX),
-    [Type]                              NVARCHAR(MAX),
-    [RecordTypeId]                      NVARCHAR(MAX),
-    [IsDeleted]                         NVARCHAR(MAX),
-    [Name]                              NVARCHAR(MAX),
-    [Status]                            NVARCHAR(MAX),
-    [StartDate]                         NVARCHAR(MAX),
-    [EndDate]                           NVARCHAR(MAX),
-    [Year__c]                           NVARCHAR(MAX),
-    [Region__c]                         NVARCHAR(MAX),
-    [CurrencyIsoCode]                   NVARCHAR(MAX),
-    [BudgetedCost]                      NVARCHAR(MAX),
-    [ActualCost]                        NVARCHAR(MAX),
-    [IsActive]                          NVARCHAR(MAX),
-    [NumberOfOpportunities]             NVARCHAR(MAX),
-    [HierarchyNumberOfOpportunities]    NVARCHAR(MAX),
-    [AmountAllOpportunities]            NVARCHAR(MAX),
-    [AmountWonOpportunities]            NVARCHAR(MAX),
-    [Casesafe_Campaign_ID__c]           NVARCHAR(MAX),
-    [Fundraising_page_url__c]           NVARCHAR(MAX),
-    [SystemModstamp]                    NVARCHAR(MAX),
-    [_etl_source]                       NVARCHAR(MAX),
-    [_etl_source_object]                NVARCHAR(MAX),
-    [_etl_loaded_at_utc]                NVARCHAR(MAX),
-    [staging_is_duplicate]              BIT,
-    [staging_duplicate_count]           INT,
-    [staging_created_at]                DATETIME
-);
-GO
-
-WITH dedup AS
-(
-    SELECT
-        [Id], [ParentId], [Type], [RecordTypeId], [IsDeleted], [Name], [Status], [StartDate], [EndDate],
-        [Year__c], [Region__c], [CurrencyIsoCode], [BudgetedCost], [ActualCost], [IsActive],
-        [NumberOfOpportunities], [HierarchyNumberOfOpportunities], [AmountAllOpportunities], [AmountWonOpportunities],
-        [Casesafe_Campaign_ID__c], [Fundraising_page_url__c], [SystemModstamp],
-        [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-        ROW_NUMBER() OVER
-        (
-            PARTITION BY CONVERT(VARCHAR(18), [Id])
-            ORDER BY COALESCE
-            (
-                TRY_CONVERT(DATETIME2(7), [SystemModstamp], 127),
-                TRY_CONVERT(DATETIME2(7), [SystemModstamp])
-            ) DESC
-        ) AS rn,
-        COUNT(*) OVER (PARTITION BY [Id]) AS dup_cnt
-    FROM [raw].[salesforce_campaign]
-    WHERE [Id] IS NOT NULL
-)
-INSERT INTO [staging].[campaign_latest]
-(
-    [row_number],
-    [Id], [ParentId], [Type], [RecordTypeId], [IsDeleted], [Name], [Status], [StartDate], [EndDate],
-    [Year__c], [Region__c], [CurrencyIsoCode], [BudgetedCost], [ActualCost], [IsActive],
-    [NumberOfOpportunities], [HierarchyNumberOfOpportunities], [AmountAllOpportunities], [AmountWonOpportunities],
-    [Casesafe_Campaign_ID__c], [Fundraising_page_url__c], [SystemModstamp],
-    [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-    [staging_is_duplicate], [staging_duplicate_count], [staging_created_at]
-)
-SELECT
-    rn,
-    [Id], [ParentId], [Type], [RecordTypeId], [IsDeleted], [Name], [Status], [StartDate], [EndDate],
-    [Year__c], [Region__c], [CurrencyIsoCode], [BudgetedCost], [ActualCost], [IsActive],
-    [NumberOfOpportunities], [HierarchyNumberOfOpportunities], [AmountAllOpportunities], [AmountWonOpportunities],
-    [Casesafe_Campaign_ID__c], [Fundraising_page_url__c], [SystemModstamp],
-    [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-    CASE WHEN dup_cnt > 1 THEN 1 ELSE 0 END,
-    CASE WHEN dup_cnt > 1 THEN dup_cnt ELSE 0 END,
-    GETUTCDATE()
-FROM dedup
-WHERE rn = 1
-  AND COALESCE(LOWER(LTRIM(RTRIM(CONVERT(NVARCHAR(20), [IsDeleted])))), N'false')
-      NOT IN (N'true', N'1', N'yes', N'y');
+EXEC staging.refresh_campaign_latest;   -- add @FullRebuild = 1 only for a deliberate reset
 
 DECLARE @stg_cnt BIGINT = (SELECT COUNT(*) FROM [staging].[campaign_latest]);
-PRINT 'Staging rows loaded: ' + CAST(@stg_cnt AS VARCHAR(30));
+PRINT 'Staging rows: ' + CAST(@stg_cnt AS VARCHAR(30));
 GO
 
 -- ============================================================================
@@ -307,17 +230,14 @@ INSERT INTO @rules VALUES
     + N'OR TRY_CONVERT(INT,[Year__c]) < 2000 OR TRY_CONVERT(INT,[Year__c]) > YEAR(GETUTCDATE()) + 1)',
     N'CAM_FRAMEWORK', N'Approved', N'DQ_FRAMEWORK', 1
 ),
--- CAM-016: Region__c must be from approved list — GUARDED (only flags when list loaded)
+-- CAM-016: Region__c listing (report-only) — surfaces distinct populated regions; no controlled list
 (
     N'Campaign', N'staging.campaign_latest', N'CAM-016', N'CUSTOM_SQL',
-    N'Region__c', N'MEDIUM', N'Region__c must be from approved list when populated (governed by staging.campaign_region_allowed_values)',
+    N'Region__c', N'LOW', N'Region__c listing (report-only): surfaces distinct populated regions for review',
     N'SELECT [Id] AS record_id, [Region__c] AS exception_value, '
-    + N'N''Region__c outside approved list'' AS exception_details, NULL AS etl_run_id '
+    + N'N''Region populated - review distinct values (report-only)'' AS exception_details, NULL AS etl_run_id '
     + N'FROM {{SOURCE_VIEW}} '
-    + N'WHERE NULLIF(LTRIM(RTRIM(COALESCE([Region__c],N''''))),N'''') IS NOT NULL '
-    + N'AND EXISTS (SELECT 1 FROM [staging].[campaign_region_allowed_values] WHERE [is_allowed]=1) '
-    + N'AND UPPER(LTRIM(RTRIM([Region__c]))) NOT IN '
-    + N'(SELECT UPPER(LTRIM(RTRIM([region_value]))) FROM [staging].[campaign_region_allowed_values] WHERE [is_allowed]=1)',
+    + N'WHERE NULLIF(LTRIM(RTRIM(COALESCE([Region__c],N''''))),N'''') IS NOT NULL',
     N'CAM_FRAMEWORK', N'Approved', N'DQ_FRAMEWORK', 1
 ),
 -- CAM-017: IsDeleted must be a valid boolean token (built-in VALID_BOOLEAN)

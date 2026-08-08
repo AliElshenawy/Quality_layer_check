@@ -30,115 +30,16 @@ SET NOCOUNT ON;
 -- ============================================================================
 -- STEP 1: REBUILD STAGING TABLE
 -- ============================================================================
-PRINT '========== ITEM_GAU FRAMEWORK MODE: STAGING REBUILD ==========';
-IF OBJECT_ID(N'[staging].[item_gau_latest]', N'V') IS NOT NULL
-    DROP VIEW [staging].[item_gau_latest];
-IF OBJECT_ID(N'[staging].[item_gau_latest]', N'U') IS NOT NULL
-    DROP TABLE [staging].[item_gau_latest];
+PRINT '========== STEP 1: BUILD STAGING (incremental — no DROP) ==========';
+-- Persistent table + incremental builder are the canonical files:
+--   database/staging/item_gau_latest_table.sql  (IF NOT EXISTS table + Id18)
+--   database/staging/item_gau_latest_SP.sql      (staging.refresh_item_gau_latest)
+-- Deploy those first (via _deploy.sql); this step only refreshes incrementally.
 
-CREATE TABLE [staging].[item_gau_latest]
-(
-    -- dedup / lineage
-    [row_number]              BIGINT,
-    -- identity
-    [Id]                      NVARCHAR(MAX),
-    [IsDeleted]               NVARCHAR(MAX),
-    [Name]                    NVARCHAR(MAX),
-    [CurrencyIsoCode]         NVARCHAR(MAX),
-    [npsp__Active__c]         NVARCHAR(MAX),
-    -- classification
-    [Product_Type__c]         NVARCHAR(MAX),
-    [Programme_Category__c]   NVARCHAR(MAX),
-    [Donation_Type__c]        NVARCHAR(MAX),
-    [Country__c]              NVARCHAR(MAX),
-    [Status__c]               NVARCHAR(MAX),
-    [Campaign__c]             NVARCHAR(MAX),
-    -- allocation flags
-    [Donation_Item_Code__c]   NVARCHAR(MAX),
-    [Allow_Single__c]         NVARCHAR(MAX),
-    [Allow_Recurring__c]      NVARCHAR(MAX),
-    [HA_Donation_Frequency__c] NVARCHAR(MAX),
-    [Stipulation__c]          NVARCHAR(MAX),
-    [Regional_Office_Code__c] NVARCHAR(MAX),
-    -- financial totals (new cycle)
-    [Total_Non_Zakat_Credit__c]         NVARCHAR(MAX),
-    [Total_Zakat_Credit__c]             NVARCHAR(MAX),
-    [Total_funds_available_sadaqa__c]   NVARCHAR(MAX),
-    [Total_funds_available_zakat__c]    NVARCHAR(MAX),
-    [npsp__Total_Allocations__c]        NVARCHAR(MAX),
-    -- description
-    [npsp__Description__c]    NVARCHAR(MAX),
-    -- ETL metadata
-    [SystemModstamp]          NVARCHAR(MAX),
-    [_etl_source]             NVARCHAR(MAX),
-    [_etl_source_object]      NVARCHAR(MAX),
-    [_etl_loaded_at_utc]      NVARCHAR(MAX),
-    [staging_is_duplicate]    BIT,
-    [staging_duplicate_count] INT,
-    [staging_created_at]      DATETIME
-);
-GO
-
-WITH dedup AS
-(
-    SELECT
-        [Id], [IsDeleted], [Name], [CurrencyIsoCode], [npsp__Active__c],
-        [Product_Type__c], [Programme_Category__c], [Donation_Type__c], [Country__c], [Status__c], [Campaign__c],
-        [Donation_Item_Code__c], [Allow_Single__c], [Allow_Recurring__c],
-        [HA_Donation_Frequency__c], [Stipulation__c], [Regional_Office_Code__c],
-        [Total_Non_Zakat_Credit__c], [Total_Zakat_Credit__c],
-        [Total_funds_available_sadaqa__c], [Total_funds_available_zakat__c],
-        [npsp__Total_Allocations__c],
-        [npsp__Description__c],
-        [SystemModstamp], [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-        ROW_NUMBER() OVER
-        (
-            PARTITION BY CONVERT(VARCHAR(18), [Id])
-            ORDER BY COALESCE
-            (
-                TRY_CONVERT(DATETIME2(7), [SystemModstamp], 127),
-                TRY_CONVERT(DATETIME2(7), [SystemModstamp])
-            ) DESC
-        ) AS rn,
-        COUNT(*) OVER (PARTITION BY [Id]) AS dup_cnt
-    FROM [raw].[salesforce_item]
-    WHERE [Id] IS NOT NULL
-)
-INSERT INTO [staging].[item_gau_latest]
-(
-    [row_number],
-    [Id], [IsDeleted], [Name], [CurrencyIsoCode], [npsp__Active__c],
-    [Product_Type__c], [Programme_Category__c], [Donation_Type__c], [Country__c], [Status__c], [Campaign__c],
-    [Donation_Item_Code__c], [Allow_Single__c], [Allow_Recurring__c],
-    [HA_Donation_Frequency__c], [Stipulation__c], [Regional_Office_Code__c],
-    [Total_Non_Zakat_Credit__c], [Total_Zakat_Credit__c],
-    [Total_funds_available_sadaqa__c], [Total_funds_available_zakat__c],
-    [npsp__Total_Allocations__c],
-    [npsp__Description__c],
-    [SystemModstamp], [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-    [staging_is_duplicate], [staging_duplicate_count], [staging_created_at]
-)
-SELECT
-    rn,
-    [Id], [IsDeleted], [Name], [CurrencyIsoCode], [npsp__Active__c],
-    [Product_Type__c], [Programme_Category__c], [Donation_Type__c], [Country__c], [Status__c], [Campaign__c],
-    [Donation_Item_Code__c], [Allow_Single__c], [Allow_Recurring__c],
-    [HA_Donation_Frequency__c], [Stipulation__c], [Regional_Office_Code__c],
-    [Total_Non_Zakat_Credit__c], [Total_Zakat_Credit__c],
-    [Total_funds_available_sadaqa__c], [Total_funds_available_zakat__c],
-    [npsp__Total_Allocations__c],
-    [npsp__Description__c],
-    [SystemModstamp], [_etl_source], [_etl_source_object], [_etl_loaded_at_utc],
-    CASE WHEN dup_cnt > 1 THEN 1 ELSE 0 END,
-    CASE WHEN dup_cnt > 1 THEN dup_cnt ELSE 0 END,
-    GETUTCDATE()
-FROM dedup
-WHERE rn = 1
-  AND COALESCE(LOWER(LTRIM(RTRIM(CONVERT(NVARCHAR(20), [IsDeleted])))), N'false')
-      NOT IN (N'true', N'1', N'yes', N'y');
+EXEC staging.refresh_item_gau_latest;   -- add @FullRebuild = 1 only for a deliberate reset
 
 DECLARE @stg_cnt BIGINT = (SELECT COUNT(*) FROM [staging].[item_gau_latest]);
-PRINT 'Staging rows loaded: ' + CAST(@stg_cnt AS VARCHAR(30));
+PRINT 'Staging rows: ' + CAST(@stg_cnt AS VARCHAR(30));
 GO
 
 -- ============================================================================
@@ -312,6 +213,27 @@ INSERT INTO @rules VALUES
     + N'WHERE NULLIF(LTRIM(RTRIM(COALESCE([Total_Zakat_Credit__c],N''''))),N'''') IS NOT NULL '
     + N'AND TRY_CONVERT(DECIMAL(18,2), [Total_Zakat_Credit__c]) IS NULL',
     N'ITEM_GAU_FINANCIAL', N'Approved', N'DQ_FRAMEWORK', 1
+),
+-- GAU-VR-001: inactive item still holds unspent funds (Salesforce VR: Deactivate_Item_After_Emptying_Funds).
+(
+    N'Item_GAU', N'staging.item_gau_latest', N'GAU-VR-001', N'CUSTOM_SQL',
+    NULL, N'MEDIUM',
+    N'Inactive item still has unspent funds (client VR: Deactivate_Item_After_Emptying_Funds) — Zakat or Non-Zakat credit > 0 while Active=false',
+    N'SELECT [Id] AS record_id, '
+    + N'CONCAT(N''Active='',COALESCE([npsp__Active__c],N''NULL''),N'';Zakat='',COALESCE([Total_Zakat_Credit__c],N''NULL''),N'';NonZakat='',COALESCE([Total_Non_Zakat_Credit__c],N''NULL'')) AS exception_value, '
+    + N'N''Inactive item still has unspent Zakat/Non-Zakat funds'' AS exception_details, NULL AS etl_run_id '
+    + N'FROM {{SOURCE_VIEW}} '
+    + N'WHERE LOWER(LTRIM(RTRIM(COALESCE([npsp__Active__c],N''false'')))) = N''false'' '
+    + N'AND (TRY_CONVERT(DECIMAL(18,2), [Total_Zakat_Credit__c]) > 0 OR TRY_CONVERT(DECIMAL(18,2), [Total_Non_Zakat_Credit__c]) > 0)',
+    N'ITEM_GAU_VALIDATION_RULE', N'Approved', N'DQ_FRAMEWORK', 1
+),
+-- GAU-VR-002: Ticket items cannot be Gift Aid Eligible (Salesforce VR: Ticket_Items_Gift_Eligibility).
+(
+    N'Item_GAU', N'staging.item_gau_latest', N'GAU-VR-002', N'CUSTOM_SQL',
+    N'Gift_Aid_Eligible__c', N'MEDIUM',
+    N'Ticket item marked Gift Aid Eligible (client VR: Ticket_Items_Gift_Eligibility)',
+    N'SELECT [Id] AS record_id, CONCAT(N''ProductType='',COALESCE([Product_Type__c],N''(null)''),N'';GiftAidEligible='',COALESCE([Gift_Aid_Eligible__c],N''(null)'')) AS exception_value, N''Ticket item marked Gift Aid Eligible'' AS exception_details, NULL AS etl_run_id FROM {{SOURCE_VIEW}} WHERE UPPER(LTRIM(RTRIM(COALESCE([Product_Type__c],N'''')))) = N''TICKET'' AND LOWER(LTRIM(RTRIM(COALESCE([Gift_Aid_Eligible__c],N''false'')))) IN (N''true'',N''1'',N''yes'')',
+    N'ITEM_GAU_VALIDATION_RULE', N'Approved', N'DQ_FRAMEWORK', 1
 ),
 -- GAU-026: npsp__Total_Allocations__c numeric
 (

@@ -96,6 +96,7 @@ Open review items:
 | GAU-024 | 8 | Non-numeric non-zakat credit |
 | GAU-025 | 2 | Non-numeric zakat credit |
 | GAU-026 | 8 | Non-numeric allocation total |
+| GAU-VR-001 | 448 | Inactive items still holding unspent Zakat/Non-Zakat funds |
 
 ---
 
@@ -105,6 +106,7 @@ Open review items:
 - Decide whether inactive status plus active flag is transitional or a hard error.
 - Confirm allow-flag expectations for Sponsorship and Ticket items.
 - Fix non-numeric financial values at source or approve a cleansing rule.
+- Review 448 inactive items that still hold unspent funds (Salesforce blocks deactivation until funds are spent) — who reallocates, and by when?
 
 ---
 
