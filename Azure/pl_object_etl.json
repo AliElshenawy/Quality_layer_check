@@ -1,0 +1,369 @@
+{
+    "name": "pl_object_etl",
+    "properties": {
+        "description": "Generic per-object ETL: incremental ingest (raw) -> stage -> DQ -> clean. Set 3 params per object: p_object (Salesforce API name) | p_raw_table (raw sink) | p_short (short name). Raw table = salesforce_<p_short>.\n\nOBJECT MAPPING (short -> Salesforce API):\n\ncampaign\nCampaign\n\nsponsorship_unit\nSponsorship_Unit__c\n\nsponsorship\nSponsorship__c\n\nitem\nnpsp__General_Accounting_Unit__c\n\npayment\nnpe01__OppPayment__c\n\ncontact\nContact\n\nrecurring_donation\nnpe03__Recurring_Donation__c\n\nopportunity\nOpportunity\n\nitem_allocation\nnpsp__Allocation__c",
+        "parameters": {
+            "p_object": {
+                "type": "string",
+                "defaultValue": "Campaign"
+            },
+            "p_raw_table": {
+                "type": "string",
+                "defaultValue": "salesforce_campaign"
+            },
+            "p_short": {
+                "type": "string",
+                "defaultValue": "campaign"
+            }
+        },
+        "activities": [
+            {
+                "name": "GetFields",
+                "type": "Lookup",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": {
+                            "value": "@concat('SELECT STRING_AGG(CONVERT(NVARCHAR(MAX), name), '', '') WITHIN GROUP (ORDER BY column_id) AS fields FROM sys.columns WHERE object_id = OBJECT_ID(N''raw.', pipeline().parameters.p_raw_table, ''') AND name NOT IN (N''_etl_run_id'', N''_etl_extracted_at_utc'', N''_etl_source_object'');')",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "sys",
+                            "p_table": "columns"
+                        }
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "GetWatermark",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "GetFields",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": {
+                            "value": "@concat('SELECT COALESCE(CONVERT(VARCHAR(19), MAX(last_watermark_value), 126) + ''Z'', ''1900-01-01T00:00:00Z'') AS wm FROM ctl.watermark_control WHERE object_name = N''', pipeline().parameters.p_object, ''';')",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "ctl",
+                            "p_table": "watermark_control"
+                        }
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "StartRun",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "GetWatermark",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": {
+                            "value": "@concat('DECLARE @now DATETIME2(7) = SYSUTCDATETIME(); INSERT INTO ctl.etl_run_control (object_name, load_type, start_time, status) VALUES (N''', pipeline().parameters.p_object, ''', N''Incremental'', @now, N''Running''); SELECT CAST(SCOPE_IDENTITY() AS BIGINT) AS run_id, CONVERT(VARCHAR(19), @now, 126) + ''Z'' AS run_start;')",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "ctl",
+                            "p_table": "etl_run_control"
+                        }
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "CopyObject",
+                "type": "Copy",
+                "dependsOn": [
+                    {
+                        "activity": "StartRun",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "SalesforceV2Source",
+                        "SOQLQuery": {
+                            "value": "@concat('SELECT ', activity('GetFields').output.firstRow.fields, ' FROM ', pipeline().parameters.p_object, ' WHERE SystemModstamp > ', activity('GetWatermark').output.firstRow.wm, ' AND SystemModstamp <= ', activity('StartRun').output.firstRow.run_start)",
+                            "type": "Expression"
+                        },
+                        "includeDeletedObjects": false,
+                        "partitionOption": "None",
+                        "preserveScaleFromSchema": false,
+                        "additionalColumns": [
+                            {
+                                "name": "_etl_run_id",
+                                "value": {
+                                    "value": "@activity('StartRun').output.firstRow.run_id",
+                                    "type": "Expression"
+                                }
+                            },
+                            {
+                                "name": "_etl_extracted_at_utc",
+                                "value": {
+                                    "value": "@utcnow()",
+                                    "type": "Expression"
+                                }
+                            },
+                            {
+                                "name": "_etl_source_object",
+                                "value": {
+                                    "value": "@pipeline().parameters.p_object",
+                                    "type": "Expression"
+                                }
+                            }
+                        ]
+                    },
+                    "sink": {
+                        "type": "AzureSqlSink",
+                        "writeBehavior": "insert",
+                        "sqlWriterUseTableLock": false
+                    },
+                    "enableStaging": false,
+                    "translator": {
+                        "type": "TabularTranslator",
+                        "typeConversion": true,
+                        "typeConversionSettings": {
+                            "allowDataTruncation": true,
+                            "treatBooleanAsNumber": false
+                        }
+                    }
+                },
+                "inputs": [
+                    {
+                        "referenceName": "ds_sf",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_object": "@pipeline().parameters.p_object"
+                        }
+                    }
+                ],
+                "outputs": [
+                    {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "raw",
+                            "p_table": "@pipeline().parameters.p_raw_table"
+                        }
+                    }
+                ]
+            },
+            {
+                "name": "FinishRun",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "CopyObject",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "ls_sql_salesforcedw_POC",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "UPDATE ctl.etl_run_control\nSET status = N'Succeeded',\n    end_time = SYSUTCDATETIME(),\n    rows_extracted = @{activity('CopyObject').output.rowsCopied},\n    rows_loaded    = @{activity('CopyObject').output.rowsCopied}\nWHERE run_id = @{activity('StartRun').output.firstRow.run_id};\n\nMERGE ctl.watermark_control AS t\nUSING (SELECT N'@{pipeline().parameters.p_object}' AS object_name) AS s\nON t.object_name = s.object_name\nWHEN MATCHED THEN UPDATE SET\n    last_watermark_value = CONVERT(DATETIME2(7), '@{activity('StartRun').output.firstRow.run_start}', 127),\n    watermark_column = N'SystemModstamp',\n    last_success_run_id = @{activity('StartRun').output.firstRow.run_id},\n    updated_at = SYSUTCDATETIME()\nWHEN NOT MATCHED THEN INSERT (object_name, watermark_column, last_watermark_value, last_success_run_id, updated_at)\n    VALUES (N'@{pipeline().parameters.p_object}', N'SystemModstamp', CONVERT(DATETIME2(7), '@{activity('StartRun').output.firstRow.run_start}', 127), @{activity('StartRun').output.firstRow.run_id}, SYSUTCDATETIME());",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00"
+                }
+            },
+            {
+                "name": "RefreshStaging",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "FinishRun",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "ls_sql_salesforcedw_POC",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "EXEC staging.refresh_@{pipeline().parameters.p_short}_latest;",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00"
+                }
+            },
+            {
+                "name": "RunDQ",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "RefreshStaging",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "ls_sql_salesforcedw_POC",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "EXEC dq.run_incremental_catalog_rules @ObjectNameFilter = N'@{pipeline().parameters.p_object}', @MaxRowsPerRule = 100000, @MaxExceptionsPerRule = 500;",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00"
+                }
+            },
+            {
+                "name": "RunClean",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "RunDQ",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "ls_sql_salesforcedw_POC",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "EXEC clean.refresh_@{pipeline().parameters.p_short};",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00"
+                }
+            }
+        ],
+        "annotations": []
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}

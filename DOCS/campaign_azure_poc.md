@@ -57,7 +57,7 @@ Salesforce Campaign
   -> [1 INGEST]   raw.salesforce_campaign         (append-only, duplicates OK)
   -> [2 STAGE]    staging.campaign_latest         (1 row per Id, no duplicates)
   -> [3 CHECK]    dq.* rules over staging          (flag violations, block criticals)
-  -> [4 CLEAN]    staging.campaign_clean          (normalized, only rows that pass gate)
+  -> [4 CLEAN]    clean.campaign                  (normalized, only rows that pass gate)
   -> [5 PUSH-READY] writeback.campaign_pending    (approved corrections queued for Salesforce)
 ```
 
@@ -101,9 +101,10 @@ FROM raw.salesforce_campaign;   -- raw_rows >= distinct_ids is expected
 
 ### Stage 2 — Stage (latest, no duplicates) — GATE
 
-- Rebuild `staging.campaign_latest` from `staging.vw_campaign_latest` (or refresh SP).
-- Dedup rule: keep rank 1 per `Id` ordered by `SystemModstamp DESC`, tie-break `_etl_run_id DESC`;
-  exclude soft-deleted rows.
+- Build/refresh `staging.campaign_latest` **incrementally (no drop)** from `raw.salesforce_campaign` via
+  `EXEC staging.refresh_campaign_latest;` (table DDL in `database/staging/campaign_latest_table.sql`;
+  proc in `database/staging/campaign_latest_SP.sql`). `@FullRebuild = 1` truncates + reloads.
+- Dedup rule: keep rank 1 per `Id` ordered by `SystemModstamp DESC`; exclude soft-deleted rows.
 - **Gate 2 (must pass):** staging has exactly one row per `Id` and zero duplicates.
 
 ```sql
@@ -134,17 +135,20 @@ If Gate 2 fails, **stop**. Do not proceed to checks or clean.
 
 ```sql
 -- GATE 3: no critical failures allowed before Clean/Final may start.
-SELECT severity, COUNT(*) AS violations, COUNT(DISTINCT record_id) AS affected_campaigns
-FROM dq.dq_exceptions
-WHERE object_name = 'Campaign'
-GROUP BY severity
-ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
-                       WHEN 'MEDIUM' THEN 3 ELSE 4 END;
+-- severity lives on dq.dq_rule_catalog; dq.dq_exceptions tracks resolution_status.
+SELECT r.severity, COUNT(*) AS violations, COUNT(DISTINCT e.record_id) AS affected_campaigns
+FROM dq.dq_exceptions e
+JOIN dq.dq_rule_catalog r ON r.rule_id = e.rule_id
+WHERE e.object_name = 'Campaign' AND e.resolution_status = 'Open'
+GROUP BY r.severity
+ORDER BY CASE r.severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
+                         WHEN 'MEDIUM' THEN 3 ELSE 4 END;
 
 -- Must return 0 for Final to begin:
 SELECT COUNT(*) AS critical_open
-FROM dq.dq_exceptions
-WHERE object_name = 'Campaign' AND severity = 'CRITICAL';
+FROM dq.dq_exceptions e
+JOIN dq.dq_rule_catalog r ON r.rule_id = e.rule_id
+WHERE e.object_name = 'Campaign' AND r.severity = 'CRITICAL' AND e.resolution_status = 'Open';
 ```
 
 Where is the DQ runner? Inspect the rule execution state (watermark cursor per rule):
@@ -160,28 +164,60 @@ ORDER BY r.rule_id;
 
 ### Stage 4 — Clean (normalized, gated build)
 
-- Build `staging.campaign_clean` **only if Gate 3 passed** (0 critical).
-- "Clean" here is intentionally simple and safe (no business overwrites without approval):
-  - trim whitespace on key text fields,
-  - normalize `CurrencyIsoCode` to upper case,
-  - cast dates via `TRY_CONVERT` (invalid -> NULL, and already flagged in DQ),
-  - normalize `IsDeleted`/`IsActive` boolean text to `0/1`,
-  - carry the `Id` and `SystemModstamp` unchanged (they are keys/lineage).
-- Rows that fail non-critical rules are still included but **tagged** (`clean_flag`, `review_reason`)
-  so nothing is silently dropped.
+> **In plain English (for the business):** the "clean" step takes the deduplicated campaigns and
+> **tidies four fields automatically** — currency codes to a standard 3-letter uppercase form, campaign
+> **status** spelling/spacing, the **active** flag to a simple Yes/No, and the campaign **year** filled
+> in from its start date. It **never deletes or overwrites blindly**: the original value is kept next to
+> the tidied one, and anything the computer is unsure about is **flagged for a person to review** rather
+> than changed. It only runs when there are **no critical problems** left, so we never "clean" bad data.
+
+> **Demonstrated result (2026-08-05, Azure POC):** 40,847 campaigns -> `clean.campaign`, **0 flagged for
+> review**. Active flag standardized to Yes/No on all 40,847 (a format change from Salesforce text
+> `true`/`false`, not 40k errors); campaign **Year filled/corrected on 17,735 (~43%)** from StartDate;
+> **currency 0 changes** and **status 0 changes** (already consistent). No critical data was touched —
+> the build ran only because 0 critical issues remained. **25 campaigns** where `AmountWon > AmountAll`
+> were raised into `dq.alert` (CAM-008, `cleaned = 0`) for finance to review — their figures were left
+> unchanged.
+
+- Lives in its **own `clean` schema** (separate from `staging`) and is built by the procedure
+  `clean.refresh_campaign` (file `database/clean/campaign_table.sql`) into the table `clean.campaign`.
+- Build **only if Gate 3 passed** (0 critical). The procedure enforces this itself: it counts open
+  CRITICAL Campaign exceptions and `RAISERROR`s (refuses to build) if any exist.
+- "Clean" here is intentionally simple and safe (no business overwrites without approval). It **corrects
+  4 checks** and keeps both the original and cleaned value side by side:
+  - **CAM-006** `CurrencyIsoCode` -> trim + UPPER  (`CurrencyIsoCode_clean`),
+  - **CAM-004** `Status` -> trim + collapse spaces + canonical case, and a **NULL/blank status is
+    defaulted to `Aborted`** (`Status_clean`),
+  - **CAM-017** `IsActive` boolean text -> `1/0` (`IsActive_clean`),
+  - **CAM-015** `Year__c` -> derived `YEAR(StartDate)` (`Year_clean`),
+  - plus typed `StartDate_clean` / `EndDate_clean` via `TRY_CONVERT` (invalid -> NULL).
+- Keys/lineage carried unchanged: `Id`, `SystemModstamp` (ETL lineage columns are omitted from clean
+  because their names differ between staging builds; `SystemModstamp` is the stable lineage key).
+- Rows that fail non-critical rules are **never dropped** — they are kept and **tagged**
+  (`clean_flag = 'REVIEW'`, `review_reason` lists the reasons: CAM-003 name, CAM-005 start>end,
+  invalid dates, unrecognized status, non-boolean IsActive, invalid currency).
+- **Business alerts (`dq.alert`):** issues the clean step **cannot** safely auto-fix are written to a
+  simple, business-facing table `dq.alert` (file `database/dq/dq_alert_table.sql`) — like
+  `dq.dq_exceptions`, but with a **`cleaned` flag** (`1` = the pipeline already fixed it, informational;
+  `0` = a person still needs to act). For now only **CAM-008 (AmountWon > AmountAll)** is raised there
+  with `cleaned = 0`, because a "won exceeds total" figure is a real discrepancy that needs human review,
+  not an automatic edit. On the current data this flags **25 campaigns**; the alert `current_value` records
+  `Won=… ; All=… ; Excess=…`.
 - **Final cannot start until this gate holds:** Clean is only populated for the in-scope, non-critical set.
 
 ```sql
 -- Final gate check before/after building clean:
 -- 1) unique per Id (inherited from staging)
 SELECT CONVERT(VARCHAR(18), Id) AS Id, COUNT(*) n
-FROM staging.campaign_clean GROUP BY CONVERT(VARCHAR(18), Id) HAVING COUNT(*) > 1;  -- expect 0
+FROM clean.campaign GROUP BY CONVERT(VARCHAR(18), Id) HAVING COUNT(*) > 1;  -- expect 0
 
 -- 2) no critical-failing Id leaked into clean
 SELECT COUNT(*) AS bad
-FROM staging.campaign_clean c
+FROM clean.campaign c
 WHERE EXISTS (SELECT 1 FROM dq.dq_exceptions e
-              WHERE e.object_name='Campaign' AND e.severity='CRITICAL'
+              JOIN dq.dq_rule_catalog r ON r.rule_id = e.rule_id
+              WHERE e.object_name='Campaign' AND r.severity='CRITICAL'
+                AND e.resolution_status='Open'
                 AND e.record_id = CONVERT(VARCHAR(18), c.Id));  -- expect 0
 ```
 
@@ -209,9 +245,9 @@ Every stage has a cursor/log so the pipeline is restartable and auditable:
 | --- | --- | --- |
 | Ingest | `ctl.watermark_control.last_watermark_value` + `ctl.etl_run_control` | set watermark NULL -> next run is Full from the start |
 | Ingest resume | `ctl.loaded_salesforce_campaign_ids` | drives ResumeMissing after a crash |
-| Stage | rebuild is deterministic from raw | re-run refresh; output is idempotent |
+| Stage | `ctl.staging_state` watermark (incremental, no drop) | re-run refresh; `@FullRebuild = 1` to reset |
 | Check | `dq.rule_execution_state.last_source_watermark_value` (per rule) | set NULL -> full re-scan from the start |
-| Clean | derived from staging + passing DQ | drop/rebuild; idempotent |
+| Clean | `ctl.clean_state` watermark; incremental MERGE by `Id` (no drop) | `EXEC clean.refresh_campaign @FullRebuild = 1` to reset |
 | Push-ready | `writeback.campaign_pending.status` | approvals are the audit trail |
 
 One combined "where are we" query answers state at any moment:
@@ -225,7 +261,8 @@ UNION ALL
 SELECT 'staging_rows', CAST(COUNT(*) AS VARCHAR(30)) FROM staging.campaign_latest
 UNION ALL
 SELECT 'critical_open', CAST(COUNT(*) AS VARCHAR(30))
-FROM dq.dq_exceptions WHERE object_name='Campaign' AND severity='CRITICAL';
+FROM dq.dq_exceptions e JOIN dq.dq_rule_catalog r ON r.rule_id = e.rule_id
+WHERE e.object_name='Campaign' AND r.severity='CRITICAL' AND e.resolution_status='Open';
 ```
 
 Because each stage is idempotent and cursor-driven, a run can stop anywhere and safely resume — and an
@@ -235,391 +272,561 @@ auditor can reconstruct the exact position from these tables without reading log
 
 ## Part E — The POC (Fully On Azure)
 
-USING **Azure Portal**
-(`portal.azure.com`) and its in-browser tools (Query editor, ADF Studio, Cloud Shell). 
+Use Azure Portal plus Cloud Shell only. Follow these steps in order and do not skip ahead.
 
- Ingest uses **ADF's native Salesforce connector** (no container image to build), which is the
-easiest fully-portal path for a 41K-row object. The container/`python.py` path from
-[azure_migration_plan.md](../../SalesForceDW/docs/azure_migration_plan.md) stays the production option, but it is not needed to prove this POC.
+### Step 0 — Requirements
 
-### How ADF runs this — what runs Python, where the logs are, and writing to `ctl`
+1. Subscription access to create Azure resources (`AI Infrastructure`).
+2. Microsoft Entra admin rights on the SQL logical server.
+3. Repository available in Cloud Shell so `sqlcmd` can run workspace files.
 
-**How Data Factory works.** ADF is a managed orchestrator. A **pipeline** is an ordered set of
-**activities** (Lookup, Copy, Script, Stored procedure, If/Until). Activities reach systems through
-**linked services** (connection + auth) and **datasets** (the table/file shape), and execute on an
-**Integration Runtime (IR)** — the serverless **Azure AutoResolve IR** (Microsoft-managed, nothing to
-install) runs Copy and pipeline activities; a **Self-hosted IR** is only needed to reach on-prem/private
-networks. A **trigger** (schedule / tumbling-window / event) starts a pipeline; for the POC just use
-**Debug** or **Trigger now**.
+### Step 1 — Create Azure resources in order
 
-**What runs Python.** In this portal-first POC, **no Python runs** — ADF's native Salesforce **Copy** does
-the ingest and every transform is **T-SQL** (Script / Stored procedure activities) inside Azure SQL. If you
-keep `python.py` (Full/Incremental/ResumeMissing), it runs as a **container** — an **Azure Container App
-Job** or an ADF **Custom activity on Azure Batch** — that ADF *triggers*. In production the plan runs the
-same Python via **Apache NiFi** (plan §4.2). So: ADF/NiFi orchestrates; a container/host runs Python.
+Do these in order. Each step's notes/details are placed directly under that step.
 
-**Where the logs are + how to see them.**
-- **ADF run history:** ADF Studio → **Monitor** → *Pipeline runs* / *Activity runs*. Each activity shows
-  input, output, duration, **rows copied**, and the error. First place to look.
-- **Persistent logs + alerts:** ADF → **Diagnostic settings** → send `PipelineRuns` / `ActivityRuns` to a
-  **Log Analytics** workspace, then query with KQL, e.g. `ADFActivityRun | where Status == 'Failed'`.
-- **Copy row-level logs:** the Copy activity's **Logging** setting writes skipped-row logs to the storage
-  account (`sfdwpocsa`).
-- **Your business log:** the `ctl.etl_run_control` / `ctl.watermark_control` rows *are* the pipeline's
-  audit trail — query them in **Query editor** (see the checks in Part C).
+1. Create resource group `Quality-check-poc` in UK South.
+2. Create Azure SQL logical server `quality-check-poc-sql` and database `SalesforceDW`.
+3. Open `SalesforceDW` Query editor once; if prompted, click **Allowlist IP**, wait up to 5 minutes,
+   then reconnect with Microsoft Entra authentication.
+4. Provide the Salesforce secret — pick **one** option:
+   - **Option A (manual, recommended for POC)** — no Key Vault; feed the secret at runtime.
+   - **Option B (Key Vault)** — create `kv-quality-check-poc` + secret `salesforce-client-secret` (needs RBAC rights).
 
-**Writing to the `ctl` schema from ADF (yes, you can).** Use a **Stored procedure** or **Script** activity
-on the Azure SQL linked service. Best practice: wrap the writes in a proc and let ADF pass parameters:
+   **Decision: Option A selected** — manual secret; Key Vault skipped (RBAC blocked). Supply the
+   secret at ingest time (Step 4, Stage 1).
+
+   ##### Option A — Manual secret (no Key Vault) — recommended for POC
+
+   Nothing to provision here. You supply the secret later, at **ingest time (Step 4, Stage 1)**,
+   using whichever ingest path you run (ADF secure string, or `python.py` local config / env var).
+   The committed `config.json` keeps `"client_secret": "__FROM_KEY_VAULT__"`; the real value is
+   never committed. RBAC does not block this option.
+
+   ##### Option B — Azure Key Vault (production-style; needs RBAC rights)
+
+   Create the vault with these wizard values:
+
+   - **Basics** — Subscription `AI Infrastructure`; Resource group `Quality-check-poc`; Name
+     `kv-quality-check-poc`; Region `UK South`; Pricing tier `Standard`; Soft-delete `Enabled`;
+     Purge protection `Disable` for POC.
+   - **Access configuration** — Permission model `Azure role-based access control (RBAC)`.
+   - **Networking** — Connectivity `Public endpoint`; allow public access for POC simplicity.
+   - **Tags** (optional) — `Environment=POC`, `Project=Quality-check-poc`, `Owner=<your-name-or-team>`.
+   - **Review + create** — verify RG `Quality-check-poc` and Region `UK South`, then `Create`.
+
+   Add the secret (fast path):
+
+   1. Open `kv-quality-check-poc` -> left menu **Objects** -> **Secrets** -> **+ Generate/Import**.
+   2. Upload options `Manual`; Name `salesforce-client-secret`; Secret value = the real client secret.
+   3. Content type (optional) `text/plain`; Activation/Expiration empty for POC; Enabled `Yes`; `Create`.
+
+   Then wire it up:
+
+   - Assign role **Key Vault Secrets User** to managed identity `quality-check-poc-adf`.
+   - Update/test the ADF linked service Key Vault reference.
+
+   Checkpoint (Option B):
+
+   - Resource `kv-quality-check-poc` exists in RG `Quality-check-poc`.
+   - Secret `salesforce-client-secret` exists.
+   - IAM: `Key Vault Secrets User` -> `quality-check-poc-adf`.
+   - ADF linked service test: `Succeeded`.
+
+   Troubleshooting (Option B):
+
+   - **`Secrets` not in left menu:** confirm you opened **Key vaults** (not **Managed HSM**); if the
+     menu shows only favorites, press **Ctrl+Shift+F**, pin **Secrets**; otherwise open **Objects -> Secrets**.
+   - **Direct link:**
+     `https://portal.azure.com/#resource/subscriptions/a5bd9c81-c288-4a80-9e39-bb06f8d35b5f/resourceGroups/Quality-check-poc/providers/Microsoft.KeyVault/vaults/kv-quality-check-poc/secrets`
+   - **`The operation is not allowed by RBAC`:** you lack a data-plane role. Get **Key Vault Secrets
+     Officer** on the vault (ask an admin if **Add role assignment** is disabled), wait 2-5 minutes, retry.
+
+   Security rule (both options): never store the real secret in committed repo files or markdown.
+   Keep a placeholder (e.g. `__FROM_KEY_VAULT__`) in committed config and resolve at runtime.
+
+5. Create storage account `qualitycheckpocsa` with Hierarchical namespace ON, then create container `raw`.
+
+   Storage account wizard picks (use these exact values):
+
+   - **Basics**
+     - Subscription: `AI Infrastructure`
+     - Resource group: `Quality-check-poc`
+     - Storage account name: `qualitycheckpocsa`
+     - Region: `UK South`
+     - Primary service: `Azure Blob Storage or Azure Data Lake Storage Gen2`
+     - Performance: `Standard` (general-purpose v2)
+     - Redundancy: `LRS` (Locally-redundant storage) — cheapest, fine for POC
+   - **Advanced**
+     - Hierarchical namespace: **Enabled** (REQUIRED — makes it ADLS Gen2). The portal default is
+       **Disabled**, so you must turn it ON in the **Advanced** tab. It **cannot** be changed after
+       creation — if created Disabled, delete and recreate.
+     - Leave other options at defaults for POC
+   - **Networking / Data protection / Encryption**: defaults are fine for POC
+   - **Review + create**: on the review screen, confirm **Enable hierarchical namespace = Enabled**,
+     verify RG `Quality-check-poc` and Region `UK South`, then `Create`
+
+   After the account is created:
+
+   - Open the account -> **Containers** -> **+ Container** -> Name `raw` -> Create.
+
+   Status: **Done** — storage account `qualitycheckpocsa` created (hierarchical namespace `Enabled`;
+   Standard / LRS / Hot). Next: create the `raw` container.
+
+6. Create Data Factory `quality-check-poc-adf`.
+
+   Data Factory wizard picks (use these exact values):
+
+   - **Basics**
+     - Subscription: `AI Infrastructure`
+     - Resource group: `Quality-check-poc`
+     - Name: `quality-check-poc-adf`
+     - Region: `UK South` (the wizard may default to `East US` — change it)
+     - Version: `V2` (ignore the "Fabric Data Factory" upsell for this POC)
+   - **Git configuration**: select **Configure Git later** (keep POC simple; link Git afterward if needed)
+   - **Networking / Advanced / Tags**: defaults are fine for POC
+   - **Review + create**: verify RG `Quality-check-poc` and Region `UK South`, then `Create`
+
+   Status: review values confirmed — `quality-check-poc-adf`, RG `Quality-check-poc`, Region
+   `UK South`, `V2`, Public endpoint. Safe to `Create`.
+
+7. In Data Factory -> Identity, confirm System assigned = On and copy Object (principal) ID.
+
+   Status: **Done** — ADF Object (principal) ID: `35527fc6-2247-4355-9011-996c291fef95`
+   (use this as `ADF_OBJECT_ID` in Step 3).
+
+8. Grant IAM to the Data Factory managed identity:
+   - Storage: **Storage Blob Data Contributor** (on `qualitycheckpocsa`).
+   - Key Vault: **not needed** — Option A selected (no Key Vault).
+
+   If **Add role assignment** is disabled (you lack Owner / User Access Administrator), use the
+   **account-key workaround** instead of managed-identity RBAC — no admin needed:
+
+   1. Open `quality-check-poc-adf` in the Portal -> click **Launch studio** (opens `adf.azure.com` in a
+      new tab). **Manage** and **Linked services** live inside the Studio, not the Portal page.
+   2. In the Studio's far-left icon rail, click **Manage** (toolbox icon) -> **Connections** ->
+      **Linked services** -> **+ New** -> **Azure Data Lake Storage Gen2**.
+   3. Fill the **New linked service** form:
+      - Name: `ls_adls_qualitycheckpocsa`
+      - Connect via integration runtime: `AutoResolveIntegrationRuntime`
+      - Authentication type: `Account key`
+      - Account selection method: `From Azure subscription` (ADF pulls the key automatically — no need
+        to copy it manually)
+      - Azure subscription: `AI Infrastructure`
+      - Storage account name: `qualitycheckpocsa`
+   4. **Test connection** (`To linked service`) -> **Create**. Use this linked service for the `raw` container.
+
+   Fallback — if `From Azure subscription` fails, use `Enter manually`:
+
+   - Open `qualitycheckpocsa` -> **Security + networking** -> **Access keys** -> **Show** -> copy the
+     **key1 connection string**, then paste it into the linked service and Test again.
+
+   Notes:
+   - The account key is a broad secret — keep it only in ADF (secure string), never in the repo.
+   - Preferred long-term: ask an admin to assign **Storage Blob Data Contributor** to
+     `quality-check-poc-adf`, then switch the linked service to **Managed identity**.
+   - A scoped **SAS token** is a middle-ground alternative to the full account key.
+
+Stop here and verify all resources exist before Step 2.
+
+Verification checklist (all must pass before Step 2):
+
+1. Resource group `Quality-check-poc` lists: `quality-check-poc-sql`, `SalesforceDW`,
+   `qualitycheckpocsa`, `quality-check-poc-adf`.
+2. `SalesforceDW` -> Overview -> Status = `Online`.
+3. `qualitycheckpocsa` -> **Containers** -> `raw` exists.
+4. `quality-check-poc-adf` -> **Identity** -> System assigned = `On`
+   (Object ID `35527fc6-2247-4355-9011-996c291fef95`).
+5. ADF Studio -> **Manage** -> **Linked services** -> `ls_adls_qualitycheckpocsa` test = `Succeeded`.
+
+Status: item 1 **Done** — all resources present in RG `Quality-check-poc` (a `kv-quality-check-poc`
+vault also exists but is unused under Option A; leave or delete later). Items 2-5 still to confirm.
+
+If all pass, proceed to Step 2.
+
+### Step 2 — Deploy SQL objects in order
+
+You can deploy either from **Cloud Shell** (the `>_` icon in the Portal top bar) or, if Cloud Shell
+is unavailable, from the **Portal Query editor**. Pick one.
+
+**Option 1 — Cloud Shell (sqlcmd):**
+
+```bash
+cd Quality_layer_check/database
+sqlcmd -S quality-check-poc-sql.database.windows.net -d SalesforceDW -G -N -C -b -i _deploy.sql
+sqlcmd -S quality-check-poc-sql.database.windows.net -d SalesforceDW -G -N -C -b -i "../DQ Frame work/DQ_framework_creation_incremental.sql"
+sqlcmd -S quality-check-poc-sql.database.windows.net -d SalesforceDW -G -N -C -b -i "../DQ Frame work/DQ_framework_seed_checks_from_existing_prod.sql"
+```
+
+If `sqlcmd -G` returns `Default account could not be found`, you are not in an authenticated Entra context. Run the commands in Azure Cloud Shell.
+
+**Option 2 — Portal Query editor (no Cloud Shell):**
+
+1. Portal -> `SalesforceDW` -> **Query editor (preview)** -> sign in with **Microsoft Entra**.
+2. Open the pre-merged file `Quality_layer_check/database/deploy_merged.sql` (it already inlines every
+   `_deploy.sql` include in order, plus the DQ framework), copy all, paste into the editor, **Run**.
+3. If the editor errors on a `GO` batch or times out, run the file in a few smaller chunks
+   (split on `GO` boundaries) until it completes.
+4. Re-run is safe: the scripts are written to be idempotent.
+
+Status: **Done** — SQL objects deployed via Portal Query editor (Option 2). Next: Step 3.
+
+### Step 3 — Create the Data Factory SQL principal
+
+This creates `quality-check-poc-adf` inside `SalesforceDW`.
+
+**Option 1 — Cloud Shell (sqlcmd):**
+
+```bash
+sqlcmd -S quality-check-poc-sql.database.windows.net -d SalesforceDW -G -N -C -b -v ADF_OBJECT_ID="35527fc6-2247-4355-9011-996c291fef95" -i ctl/create_adf_sql_user.sql
+```
+
+**Option 2 — Portal Query editor (no Cloud Shell):** paste and Run this (GUID already inlined):
 
 ```sql
--- one-time: a proc ADF calls after each load
-CREATE OR ALTER PROCEDURE ctl.save_campaign_run
-    @load_type varchar(20), @status varchar(20), @rows int, @new_wm varchar(33), @start datetime2
-AS
+SET NOCOUNT ON;
+
+DECLARE @ObjectId nvarchar(64) = N'35527fc6-2247-4355-9011-996c291fef95';
+
+IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'quality-check-poc-adf')
 BEGIN
-  INSERT INTO ctl.etl_run_control (object_name, load_type, status, rows_loaded, start_time, end_time)
-  VALUES ('Campaign', @load_type, @status, @rows, @start, SYSUTCDATETIME());
-  UPDATE ctl.watermark_control
-     SET last_watermark_value = @new_wm, last_success_run_id = SCOPE_IDENTITY()
-   WHERE object_name = 'Campaign';
-END
+    DECLARE @CreateUserSql nvarchar(max) =
+        N'CREATE USER [quality-check-poc-adf] FROM EXTERNAL PROVIDER WITH OBJECT_ID = '''
+        + @ObjectId + N''';';
+    EXEC (@CreateUserSql);
+END;
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.database_role_members drm
+    JOIN sys.database_principals r ON r.principal_id = drm.role_principal_id
+    JOIN sys.database_principals m ON m.principal_id = drm.member_principal_id
+    WHERE r.name = N'db_owner' AND m.name = N'quality-check-poc-adf')
+BEGIN
+    ALTER ROLE db_owner ADD MEMBER [quality-check-poc-adf];
+END;
+
+SELECT name, type_desc FROM sys.database_principals WHERE name = N'quality-check-poc-adf';
 ```
 
-Then add a **Stored procedure activity** `save_wm` and map its parameters from pipeline expressions:
-`@activity('copy_campaign').output.rowsCopied`, `@activity('new_wm').output.firstRow.wm`,
-`@pipeline().TriggerTime`. That is exactly the `save_wm` step in Stage 1 below.
+name | type_desc
+-----|----------
+quality-check-poc-adf | EXTERNAL_USER
 
-Resource names used below (create them once): resource group `rg-sfdw-poc`, SQL server `sfdw-poc-sql`,
-database `SalesforceDW`, Key Vault `kv-sfdw-poc`, storage `sfdwpocsa`, data factory `sfdw-poc-adf`
-(region UK South because the data is GBP).
-
-### Prerequisite A — Provision (Portal, click-through)
-
-1. **Resource group** — Portal -> Resource groups -> Create -> `rg-sfdw-poc`, region UK South.
-2. **Azure SQL Database** — Create a resource -> SQL Database -> new server `sfdw-poc-sql`
-   (Authentication: **Microsoft Entra-only**, set yourself as admin), database `SalesforceDW`,
-   Compute+storage: **Serverless**, auto-pause 1 hour. Networking tab: turn on
-   **Allow Azure services and resources to access this server**.
-3. **Key Vault** — Create -> `kv-sfdw-poc` (RBAC permission model). Then Secrets -> Generate/Import ->
-   `salesforce-client-secret` and paste the value.
-4. **Storage (ADLS Gen2)** — Create -> Storage account `sfdwpocsa`, Advanced tab: enable
-   **Hierarchical namespace**. After create: Containers -> + Container -> `raw`.
-5. **Data Factory** — Create -> Data Factory `sfdw-poc-adf`, UK South. Open **Azure Data Factory Studio**.
-6. **Identity + access** — the data factory gets a **system-assigned managed identity** automatically.
-   Grant it access:
-   - Key Vault -> Access control (IAM) -> Add role assignment -> **Key Vault Secrets User** -> the ADF identity.
-   - Storage account -> IAM -> **Storage Blob Data Contributor** -> the ADF identity.
-   - In Azure SQL (see Prereq B), add the ADF identity as a database user.
-
-### Prerequisite B — Deploy the database objects (Portal Query editor)
-
-Open the database `SalesforceDW` -> **Query editor (preview)** -> sign in with Entra ID. It runs in the
-browser (on Azure). Paste and run each script's contents in this order (skip `00_database.sql` — the DB
-already exists):
-
-1. `database/00_schemas.sql`
-2. every file in `database/raw/`, then `database/ctl/`, then `database/dq/`, then `database/staging/`
-3. `mohey_work/DQ Frame work/DQ_framework_creation_incremental.sql`
-4. `mohey_work/DQ Frame work/DQ_framework_seed_checks_from_existing_prod.sql`
-
-Then grant the ADF managed identity access (run once in Query editor):
+Validate:
 
 ```sql
-CREATE USER [sfdw-poc-adf] FROM EXTERNAL PROVIDER;   -- ADF managed identity name
-ALTER ROLE db_owner ADD MEMBER [sfdw-poc-adf];
+SELECT name, type_desc
+FROM sys.database_principals
+WHERE name = 'quality-check-poc-adf';
 ```
 
-> Tip: if pasting many files is tedious, open **Cloud Shell** (top bar `>_`), `git clone` the repo, and
-> run `sqlcmd -S sfdw-poc-sql.database.windows.net -d SalesforceDW -G -N -C -b -i <file>`. Cloud Shell is
-> still Azure, not your PC.
+If principal creation fails, wait 2-10 minutes for Entra propagation and rerun Step 3.
 
-### Stage 1 — Ingest: test BOTH paths (A = ADF Copy, B = container Python)
+Status: **Done** — principal `quality-check-poc-adf` created (`EXTERNAL_USER`, `db_owner`).
 
-The POC deliberately proves **two ingest paths** into the *same* `raw.salesforce_campaign`, so Stages 2–5
-(stage → check → clean) are identical whichever ran. Run **Path A**, check the counts; then run **Path B**
-into the same raw table and confirm it behaves the same — append-only, watermark advances, and
-ResumeMissing recovers a crash. Both record their run in `ctl.etl_run_control`.
+> Note: `SalesforceDW` is **serverless** and auto-pauses when idle. A `Database ... is not currently
+> available. Please retry` error just means it is resuming — wait ~30-60s and retry the query.
 
-> Before Azure: validate the SQL side (the clean/fix build and the `ctl` logging proc) locally with
-> [campaign_poc_local_test.sql](campaign_poc_local_test.sql). The two ingest paths themselves need Azure.
+### Step 4 — Run pipeline stages in sequence (with gates)
 
-#### Path A — ADF native Salesforce Copy (portal-first, no code to host)
+1. Stage 1 Ingest:
+   - Run Path A (ADF Copy) first.
 
-This path uses the **ADF Salesforce (V2) connector** — Microsoft Learn:
-[Copy data from and to Salesforce](https://learn.microsoft.com/en-us/azure/data-factory/connector-salesforce?tabs=data-factory).
-It talks to Salesforce **Bulk API 2.0** natively (the same API our Python uses), so there is no code to host.
+     Feed the Salesforce secret in the ADF Salesforce linked service:
+     - **Option B (Key Vault):** set the client secret to an **`Azure Key Vault`** reference to
+       secret `salesforce-client-secret`.
+     - **Option A (manual):** set the client secret field type to **`Secure string`** and paste the
+       value directly. ADF stores it encrypted; no Key Vault role is needed.
 
-**Is it better than `python.py`? For standard ingest, yes (small compare):**
-- **Less to build/run** — managed connector, no image or host; built-in retry + monitoring.
-- **Bulk API 2.0 built in** — issues the Bulk query for you; Full = no filter, Incremental = `WHERE SystemModstamp > @watermark`.
-- **Same "args"** — Full vs Incremental is just the source query/watermark, mirroring Python's `--mode`.
-- **Where Python still wins** — our custom **ResumeMissing** crash-recovery (loaded-ids) is not native; the connector would re-query the window instead.
-- **Verdict** — use the connector for plain Full/Incremental (less code/ops); keep Python where ResumeMissing matters.
+     Path A walkthrough (Option A manual) — do these in ADF Studio:
 
-In **ADF Studio** build the linked services and the incremental copy. No code on your PC.
+     1. **Salesforce source linked service:** Manage -> Linked services -> **+ New** -> search
+        `Salesforce` -> pick **Salesforce V2** (the general object/SOQL connector; **not** "Salesforce
+        Service Cloud V2", which is for Service Cloud).
+        - Name: `ls_salesforce_poc`
+        - Connect via: `AutoResolveIntegrationRuntime`
+        - Environment URL: `https://humanappeal.my.salesforce.com`
+        - Authentication type: `OAuth 2.0 Client Credential`
+        - Client Id (Consumer Key): your Salesforce `client_id`
+        - Client secret (Consumer Secret): choose **`Secure string`** and paste the real secret
+        - API version: `67.0` (optional)
+        - **Test connection** -> **Create**
+     2. **SQL sink linked service** (uses the Step 3 managed-identity principal): Manage ->
+        Linked services -> **+ New** -> **Azure SQL Database**.
+        - Name: `ls_sql_salesforcedw_POC`
+        - Account selection: `From Azure subscription` -> server `quality-check-poc-sql` ->
+          database `SalesforceDW`
+        - Authentication type: `System-assigned managed identity`
+        - **Test connection** -> **Create** (works because `quality-check-poc-adf` has `db_owner`)
+     3. **Build the pipeline `pl_ingest_campaign`.**
 
-1. **Linked services** (Manage -> Linked services -> New):
-   - **Salesforce (V2)** — auth via **Connected App / OAuth**, set the **API version**, Bulk API 2.0; put the
-     client secret as a **Key Vault reference** to `kv-sfdw-poc/salesforce-client-secret` (never typed in
-     ADF). Setup steps + supported properties: [connector docs](https://learn.microsoft.com/en-us/azure/data-factory/connector-salesforce?tabs=data-factory).
-   - **Azure SQL Database** — server `sfdw-poc-sql`, db `SalesforceDW`, auth **System-assigned managed identity**.
-2. **Incremental copy pipeline** `pl_campaign_ingest` (this is the watermark pattern that maps to
-   `ctl.watermark_control`, so raw stays append-only and duplicates are allowed):
-   - **Lookup** `old_wm`: `SELECT last_watermark_value FROM ctl.watermark_control WHERE object_name='Campaign'`
-   - **Lookup** `new_wm`: `SELECT CONVERT(VARCHAR(33), SYSUTCDATETIME(), 126) AS wm`
-   - **Copy** `copy_campaign`: source = Salesforce query
-     `SELECT ... FROM Campaign WHERE SystemModstamp > @{activity('old_wm').output.firstRow.last_watermark_value} AND SystemModstamp <= @{activity('new_wm').output.firstRow.wm}`;
-     sink = `raw.salesforce_campaign`, **Insert** (append, no upsert — duplicates OK in raw).
-   - **Stored procedure** `save_wm`: call `ctl.save_campaign_run` to log the run and advance the watermark
-     (parameters mapped from pipeline expressions — see Part E primer). First run has NULL watermark = Full from start.
-3. **Run** — prove **Full** (empty table / NULL watermark = no filter) then **Incremental** (watermark
-   filter): the two runs that mirror Python's `--mode Full/Incremental`, using the same query/watermark
-   *args*. Debug or Trigger now; because the watermark is stored, re-runs are incremental and restartable
-   from the last committed point (the "check from the start at any point" property is preserved).
+        **What you are building:** a pipeline of **three activities that run in sequence**, so every
+        ingest is logged and auditable:
 
-Verify Path A (Query editor):
+        ```text
+        StartRun (Lookup)  --success-->  CopyCampaign (Copy data)  --success-->  FinishRun (Script)
+        open a run row            move Salesforce -> raw               close the run row
+        capture run_id            (append rows + lineage)              write final row counts
+        ```
 
-```sql
-SELECT TOP 3 run_id, load_type, status, rows_loaded
-FROM ctl.etl_run_control WHERE object_name='Campaign' ORDER BY run_id DESC;
+        Why three activities instead of just a Copy? The `StartRun` / `FinishRun` pair writes a row in
+        `ctl.etl_run_control` **before and after** the copy, so you always have a run log (who ran, when,
+        how many rows, success/fail). That log is what makes the pipeline restartable and auditable.
 
-SELECT COUNT(*) raw_rows, COUNT(DISTINCT CONVERT(VARCHAR(18),Id)) distinct_ids
-FROM raw.salesforce_campaign;   -- raw_rows >= distinct_ids is expected (duplicates allowed)
-```
+        **Create the empty pipeline first:**
 
-#### Path B — `python.py` as an Azure Container App Job (keeps Full/Incremental/ResumeMissing)
+        - Open **Author** — the **pencil** icon in the Studio's far-left rail (top to bottom: Home,
+          **Author/pencil**, Monitor/gauge, Manage/toolbox). If the rail shows icons only, it is still
+          the second icon from the top.
+        - Click **+** next to *Factory Resources* -> **Pipeline**, and set the name to `pl_ingest_campaign`.
+        - Keep the **Activities** pane open on the left; you will drag three activities onto the canvas
+          in the next sub-steps.
 
-This runs your **existing** Python unchanged, so all three modes are proven end-to-end.
+        **3a. `StartRun` (Lookup) — open a run row and capture its `run_id`.**
 
-1. **Build & push the image** (Azure Cloud Shell — still Azure, not your PC):
-   ```bash
-   az acr create -g rg-sfdw-poc -n sfdwpocacr --sku Basic
-   az acr build -r sfdwpocacr -t sfdw/ingest:poc .   # builds from the repo's Dockerfile
-   ```
-2. **Create the Container App Job** (Portal → Container App Jobs → Create, *Manual* trigger):
-   - Image `sfdwpocacr.azurecr.io/sfdw/ingest:poc`; **system-assigned managed identity** on.
-   - Command/args: `python python.py --object Campaign --mode Incremental`.
-   - Env: SQL server/db + Salesforce client id; the **secret** is a **Key Vault reference** to
-     `kv-sfdw-poc/salesforce-client-secret` (never inline).
-3. **Grant the job identity** the same access as ADF: Key Vault **Secrets User**, and a SQL user
-   (`CREATE USER [job-campaign-ingest] FROM EXTERNAL PROVIDER; ALTER ROLE db_owner ADD MEMBER [job-campaign-ingest];`).
-4. **Run each mode** (Start the job, changing `--mode`):
-   - `--mode Full` on an empty table (first load, from the start),
-   - `--mode Incremental` (only `SystemModstamp > watermark`),
-   - `--mode ResumeMissing` after you kill a run mid-way (loads only ids not in
-     `ctl.loaded_salesforce_campaign_ids`).
-5. **Container logs:** Container App Job → *Execution history* → console logs, or Log Analytics table
-   `ContainerAppConsoleLogs_CL`. The run also lands in `ctl.etl_run_control`, like Path A.
+        This activity inserts a "Running" row into the control table and returns the new `run_id`, which
+        the later activities reuse so all three write to the *same* run.
 
-#### Compare A vs B (both must agree)
+        - From the **Activities** pane -> **General**, drag a **Lookup** activity onto the canvas and
+          name it `StartRun`.
+        - **Settings** tab -> **Source dataset**: this dropdown lists **datasets**, not linked services,
+          so on a new factory it is **empty** — you must create one. A dataset is a thin object that sits
+          on top of a linked service (the connection):
 
-Both land append-only into the *same* raw table and write ctl rows, so one query compares them:
+          ```text
+          Linked service  ls_sql_salesforcedw_POC   = the CONNECTION (server + db + auth)
+                ▲
+          Dataset         points at that linked service = what the activity selects
+                ▲
+          Activity        the Lookup needs a DATASET here
+          ```
 
-```sql
--- Runs recorded by each path, newest first
-SELECT run_id, object_name, load_type, status, rows_loaded, start_time, end_time
-FROM ctl.etl_run_control WHERE object_name='Campaign' ORDER BY run_id DESC;
+          - Click **+ New** next to **Source dataset** -> **Azure SQL Database** -> **Continue**.
+          - **Linked service:** `ls_sql_salesforcedw_POC`. **Table name:** pick any table
+            (e.g. `ctl.etl_run_control`) — it is ignored once you use a query below. Click **OK**.
+        - Back in **Settings**, select **Use query** -> **Query** -> paste:
 
--- Raw is still append-only after both paths ran (duplicates OK, distinct ids stable)
-SELECT COUNT(*) raw_rows, COUNT(DISTINCT CONVERT(VARCHAR(18),Id)) distinct_ids
-FROM raw.salesforce_campaign;
-```
+          ```sql
+          INSERT INTO ctl.etl_run_control (object_name, load_type, start_time, status)
+          VALUES (N'Campaign', N'Full', SYSUTCDATETIME(), N'Running');
+          SELECT CAST(SCOPE_IDENTITY() AS BIGINT) AS run_id;
+          ```
 
-| What it proves | Path A (ADF Copy) | Path B (container Python) |
-| --- | --- | --- |
-| Full / Incremental | ✅ watermark query | ✅ `--mode Full/Incremental` |
-| ResumeMissing (crash recovery) | ⚠️ not native (re-query the window) | ✅ loaded-ids table |
-| Code to host | none | container image |
-| Same raw + ctl result | ✅ | ✅ |
+        - Tick **First row only** (the query returns exactly one `run_id`).
+        - Drag the green **success** arrow from `StartRun` to where `CopyCampaign` will sit.
 
-Expectation: equal row counts and an append-only raw after each — the only difference is *how* the rows
-arrived. Path B additionally proves **ResumeMissing**, which ADF Copy does not do natively.
+        **3b. `CopyCampaign` (Copy data) — move Salesforce rows into `raw`.**
 
-### Stage 2 — Stage (dedup) as an ADF Script activity
+        This is the actual extract-and-load: it reads Campaign from Salesforce and appends every row to
+        `raw.salesforce_campaign`, tagging each row with lineage so you can trace which run produced it.
 
-Add a **Script activity** against the Azure SQL linked service (or run it in Query editor):
+        - Drag a **Copy data** activity (Activities -> **Move & transform**) onto the canvas and name it
+          `CopyCampaign`.
+        - **Source** tab -> **+ New** dataset -> **Salesforce** -> linked service `ls_salesforce_poc` ->
+          Object API name `Campaign` (or supply a SOQL query such as `SELECT ... FROM Campaign`).
 
-```sql
-EXEC ctl.refresh_latest_views;   -- rebuilds staging.vw_campaign_latest (1 row per Id)
-```
+          > **Common mistake — Source dataset set to Azure SQL instead of Salesforce.** The Copy's
+          > **Source** must be a **Salesforce** dataset, not SQL. If the Source's **Learn more** link
+          > reads `connector-azure-sql-database` (or you see `Use query / Table / Stored procedure`
+          > SQL options), you reused/created the wrong dataset. **Import schemas** on the **Mapping** tab
+          > will then fail or map nothing. Fix: **+ New** dataset -> **Salesforce** -> `ls_salesforce_poc`
+          > -> object `Campaign`, and confirm the Source's Learn more link now says `connector-salesforce`.
+          > Only the **Sink** stays Azure SQL Database (`raw.salesforce_campaign`).
 
-Gate 2 — add a **Lookup** activity; fail the pipeline if it returns > 0:
+        - **Source** tab -> **Additional columns** -> add these 3 lineage values (correct ETL practice —
+          do **not** leave them NULL):
 
-```sql
-SELECT COUNT(*) AS dup_ids FROM (
-  SELECT CONVERT(VARCHAR(18),Id) Id FROM staging.campaign_latest
-  GROUP BY CONVERT(VARCHAR(18),Id) HAVING COUNT(*) > 1
-) x;   -- must be 0
-```
+          | Column | Value |
+          | --- | --- |
+          | `_etl_run_id` | `@activity('StartRun').output.firstRow.run_id` |
+          | `_etl_extracted_at_utc` | `@utcnow()` |
+          | `_etl_source_object` | `Campaign` (static text) |
 
-### Stage 3 — Check (incremental DQ) as an ADF Stored Procedure activity
+        - **Sink** tab -> **+ New** dataset -> **Azure SQL Database** -> linked service
+          `ls_sql_salesforcedw_POC` -> table `raw.salesforce_campaign`.
+        - **Mapping** tab -> **Import schemas** -> confirm the Salesforce fields map to the `raw` columns
+          (names match, all target columns are `NVARCHAR(MAX)`) and the 3 additional columns map to
+          `_etl_run_id` / `_etl_extracted_at_utc` / `_etl_source_object`.
 
-```sql
-EXEC dq.run_incremental_catalog_rules
-     @ObjectNameFilter='Campaign', @MaxRowsPerRule=100000, @MaxExceptionsPerRule=500;
-```
+          > **If Import schemas shows only the "Additional expressions" (not the Salesforce fields):**
+          > the connector could not fetch the object schema. Easiest fix for a raw load — **Clear** the
+          > mapping and leave it **empty**. Because every `raw.salesforce_campaign` column is
+          > `NVARCHAR(MAX)` and the names already match Salesforce field names, ADF **auto-maps by name
+          > at runtime**, including the 3 `_etl_*` additional columns. (A `Value Required` warning means
+          > an Additional column on the **Source** tab lost its value — re-enter the three.) To map
+          > explicitly instead, click **Preview data** on the Source first; if it returns rows, Import
+          > schemas will populate. If Preview fails, set the dataset **Object API name = `Campaign`** or
+          > switch the Source to a **SOQL Query** (`SELECT Id, Name, ... FROM Campaign`).
 
-Gate 3 — **Lookup**; fail the pipeline if critical > 0:
+          > **If Import schemas pops "Please provide actual value of the parameters to get schema":**
+          > it is trying to *evaluate* the `_etl_run_id` additional column
+          > (`@activity('StartRun').output.firstRow.run_id`) at design time, but that value only exists
+          > **at runtime** after `StartRun` executes. Do **not** enter a fake value — **Cancel** the
+          > dialog, **Clear** the Mapping, and leave it empty (runtime auto-map by name resolves the
+          > expression correctly). If you must import explicitly, temporarily delete the `_etl_run_id`
+          > additional column, run Import schemas, then re-add `_etl_run_id` on the Source tab afterward.
 
-```sql
-SELECT COUNT(*) AS critical_open
-FROM dq.dq_exceptions WHERE object_name='Campaign' AND severity='CRITICAL';   -- must be 0
-```
+        - Drag the green **success** arrow from `CopyCampaign` to where `FinishRun` will sit.
 
-Full re-scan from the start (reset the per-rule cursor, then re-run Stage 3):
+        **3c. `FinishRun` (Script) — close the run row with final counts.**
 
-```sql
-UPDATE s SET s.last_source_watermark_value=NULL
-FROM dq.rule_execution_state s
-JOIN dq.dq_rule_catalog r ON r.rule_id=s.rule_id
-WHERE r.object_name='Campaign';
-```
+        This updates the same run row to `Succeeded` and records how many rows the copy moved, closing the
+        audit loop opened by `StartRun`.
 
-### Stage 4 — Clean: fix 1–2 checks, skip the rest (the part you want to SEE)
+        - Drag a **Script** activity onto the canvas, name it `FinishRun`, and connect
+          `CopyCampaign` --success--> `FinishRun`.
+        - Linked service: `ls_sql_salesforcedw_POC`. Paste into **Query**:
 
-The POC does **not** try to auto-fix everything. It **cleans two rules** where a correction is safe and
-mechanical, and **explicitly skips** the rest (recording *why*), so you can watch the difference. Every
-change keeps the original value alongside the new one, so it is auditable and can feed writeback.
+          ```sql
+          UPDATE ctl.etl_run_control
+          SET status = N'Succeeded',
+              end_time = SYSUTCDATETIME(),
+              rows_extracted = @{activity('CopyCampaign').output.rowsCopied},
+              rows_loaded    = @{activity('CopyCampaign').output.rowsCopied}
+          WHERE run_id = @{activity('StartRun').output.firstRow.run_id};
+          ```
 
-**Cleaned (auto-corrected — safe, mechanical):**
-- **CAM-006 CurrencyIsoCode** → `UPPER(LTRIM(RTRIM(...)))` (`'gbp '` → `'GBP'`).
-- **CAM-004 Status** → `LOWER(LTRIM(RTRIM(...)))` (case/whitespace only; unknown values stay flagged).
-- **IsActive** → normalize boolean text to `0/1`.
-- **CAM-015 Year__c** → when blank/invalid, derive from `YEAR(StartDate)` (mark for business confirm).
+     4. **Test the pipeline:** click **Validate** (top toolbar) to catch config errors, then **Debug**
+        to run it once without publishing. Watch the **Output** pane until all three activities show
+        **Succeeded**.
+     5. **Publish and run for real:** when Debug succeeds, click **Publish all** to save the pipeline,
+        then **Add trigger -> Trigger now** to execute it on demand.
 
-> Pick which checks to promote to fixes from the **rule table at the end of this stage** — it labels every
-> rule *technical* vs *business*. Only the *technical / mechanical* ones belong here; *business* ones stay
-> SKIPPED and go to writeback.
+   - Optional: run Path B (`python.py` container job) only if you need ResumeMissing proof.
 
-**Skipped (NOT auto-changed — recorded for review):**
-- CAM-003 blank `Name`, CAM-005 start>end, CAM-010 missing parent, CAM-008/013 rollups, CAM-016 region,
-  and the rest: cannot be safely auto-fixed, so they are tagged `SKIPPED` with a reason and routed to
-  review/writeback.
+     > **Path A vs Path B — which to use.** Use **Path A (ADF Copy)** as the primary loader: it is the
+     > cheapest (pure pay-per-run, ~$0.05–0.10 per Campaign run, nothing idle), needs no code or image,
+     > and is already built. Use **Path B** only to prove what Copy cannot — **Full / Incremental /
+     > ResumeMissing** mode selection and crash resume by missing `Id`.
+     >
+     > **How Path B runs on Azure (portal-triggerable, with logs):** package `python.py` as a container
+     > and run it as an **Azure Container Apps Job** — the serverless, scale-to-zero, pay-per-second
+     > model (the closest "Lambda-style" fit that still supports the native **ODBC Driver 18** the
+     > script needs). Trigger it from the portal (**Run now**) or from ADF via a Web activity; logs go
+     > to the job console / Log Analytics. Auth to Azure SQL uses the job's **managed identity**
+     > (`Authentication=ActiveDirectoryManagedIdentity`), granted a DB user exactly like the
+     > `quality-check-poc-adf` principal in Step 3. Inject the Salesforce secret at runtime via a
+     > Container Apps **secret** / env var — never bake it into the image.
+     >
+     > **Why not Azure Functions (the Lambda equivalent)?** Considered and rejected for this workload:
+     > the cheap **Consumption** plan cannot install the native **ODBC Driver 18** `pyodbc` needs and
+     > caps a run at **10 min** (a problem for the big objects later). Fixing both forces a custom
+     > container on a **Premium/Flex** plan, which costs more than the container route with no gain.
+     > **Container Apps Job wins** for this `pyodbc` ingester.
 
-Concrete build (this is `campaign_clean_build.sql`, to be created — runs as an ADF Script activity, only
-after Gate 3 passed):
+     Feed the Salesforce secret for Path B:
 
-```sql
--- Idempotent: rebuild each run.
-DROP TABLE IF EXISTS staging.campaign_clean;
+2. Stage 2 Stage (dedup):
+   - Run `EXEC staging.refresh_campaign_latest;` (rebuilds `staging.campaign_latest` directly from
+     `raw.salesforce_campaign`, deduped to one row per Id, with the
+     `staging_is_duplicate` / `staging_duplicate_count` / `staging_created_at` columns).
+   - Gate: duplicate Id count in `staging.campaign_latest` = 0.
+3. Stage 3 Check (DQ):
+   - Run `EXEC dq.run_incremental_catalog_rules @ObjectNameFilter='Campaign', @MaxRowsPerRule=100000, @MaxExceptionsPerRule=500;`.
+   - Gate: CRITICAL exception count = 0.
+4. Stage 4 Clean:
+   - Create the `clean` schema + procedure once (already in the deploy scripts): the schema is created in
+     `00_schemas.sql` and the procedure `clean.refresh_campaign` in `database/clean/campaign_table.sql`.
+     If your deployed DB predates these files, run the contents of `database/clean/campaign_table.sql`
+     once in Query editor (it is a `CREATE OR ALTER PROCEDURE`, safe to re-run).
+   - Build it: `EXEC clean.refresh_campaign;` (blocks itself if any CRITICAL exception is open).
+   - Gate: `clean.campaign` has unique Ids and no CRITICAL leak (queries above).
+   - **Show the corrections (before staging vs after clean), joined on Id:**
 
-SELECT
-    s.Id,
-    s.SystemModstamp,
-    -- CLEANED #1: currency normalized (CAM-006)
-    UPPER(LTRIM(RTRIM(s.CurrencyIsoCode)))          AS CurrencyIsoCode,
-    s.CurrencyIsoCode                               AS CurrencyIsoCode_original,
-    -- CLEANED #2: status case/whitespace (CAM-004)
-    LOWER(LTRIM(RTRIM(s.Status)))                   AS Status,
-    s.Status                                        AS Status_original,
-    -- CLEANED #3: IsActive boolean -> 0/1
-    CASE WHEN LOWER(LTRIM(RTRIM(COALESCE(s.IsActive,'')))) IN ('true','1','yes','y')  THEN 1
-         WHEN LOWER(LTRIM(RTRIM(COALESCE(s.IsActive,'')))) IN ('false','0','no','n') THEN 0
-         ELSE NULL END                              AS IsActive,
-    s.IsActive                                      AS IsActive_original,
-    -- CLEANED #4: Year derived from StartDate when blank/invalid (CAM-015) -- business-confirm
-    COALESCE(
-      CASE WHEN TRY_CONVERT(int,s.Year__c) BETWEEN 2000 AND YEAR(GETDATE())+1
-           THEN TRY_CONVERT(int,s.Year__c) END,
-      YEAR(TRY_CONVERT(date,s.StartDate)))          AS Year__c,
-    s.Year__c                                       AS Year__c_original,
-    -- carried unchanged (skipped fields keep raw value)
-    s.Name, s.StartDate, s.EndDate, s.ParentId,
-    -- per-row clean audit (binary collation so case/whitespace-only changes are detected)
-    CASE WHEN s.CurrencyIsoCode COLLATE Latin1_General_BIN2 <> UPPER(LTRIM(RTRIM(s.CurrencyIsoCode))) COLLATE Latin1_General_BIN2 THEN 'CLEANED' ELSE 'OK' END AS clean_currency,
-    CASE WHEN s.Status COLLATE Latin1_General_BIN2 <> LOWER(LTRIM(RTRIM(s.Status))) COLLATE Latin1_General_BIN2 THEN 'CLEANED' ELSE 'OK' END AS clean_status,
-    CASE
-      WHEN s.Name IS NULL OR LTRIM(RTRIM(s.Name))=''                        THEN 'SKIPPED: blank name (CAM-003)'
-      WHEN TRY_CONVERT(date,s.StartDate) > TRY_CONVERT(date,s.EndDate)      THEN 'SKIPPED: start>end (CAM-005)'
-      WHEN LOWER(LTRIM(RTRIM(s.Status))) NOT IN
-           ('active','planned','inactive','completed','aborted','in progress') THEN 'SKIPPED: status value needs business rule (CAM-004)'
-      ELSE 'NONE'
-    END AS review_reason
-INTO staging.campaign_clean
-FROM staging.campaign_latest s;
-```
+     ```sql
+     -- Cleaned vs skipped summary
+     SELECT clean_flag, COUNT(*) AS rows
+     FROM clean.campaign GROUP BY clean_flag;   -- CLEAN vs REVIEW counts
 
-See exactly what got cleaned vs skipped (this is the demonstration output):
+     -- CAM-006 currency: rows the clean step actually changed (before -> after)
+     SELECT TOP 20 c.Id, c.CurrencyIsoCode_raw AS before_currency, c.CurrencyIsoCode_clean AS after_currency
+     FROM clean.campaign c
+     JOIN staging.campaign_latest s ON CONVERT(VARCHAR(18), s.Id) = CONVERT(VARCHAR(18), c.Id)
+     WHERE ISNULL(c.CurrencyIsoCode_raw, N'') <> ISNULL(c.CurrencyIsoCode_clean, N'');
 
-```sql
-SELECT 'currency_cleaned' AS metric, COUNT(*) n FROM staging.campaign_clean WHERE clean_currency='CLEANED'
-UNION ALL SELECT 'status_cleaned',   COUNT(*) FROM staging.campaign_clean WHERE clean_status='CLEANED'
-UNION ALL SELECT 'skipped_rows',     COUNT(*) FROM staging.campaign_clean WHERE review_reason LIKE 'SKIPPED%';
-```
+     -- CAM-004 status: whitespace/case normalized (before -> after)
+     SELECT TOP 20 c.Id, c.Status_raw AS before_status, c.Status_clean AS after_status
+     FROM clean.campaign c
+     JOIN staging.campaign_latest s ON CONVERT(VARCHAR(18), s.Id) = CONVERT(VARCHAR(18), c.Id)
+     WHERE ISNULL(c.Status_raw, N'') <> ISNULL(c.Status_clean, N'');
 
-Final gate on clean (both must return 0):
+     -- CAM-017 IsActive + CAM-015 Year derived from StartDate (before -> after)
+     SELECT TOP 20 c.Id,
+            c.IsActive_raw AS before_isactive, c.IsActive_clean AS after_isactive,
+            c.Year_raw     AS before_year,     c.Year_clean     AS after_year,
+            c.StartDate_raw
+     FROM clean.campaign c
+     JOIN staging.campaign_latest s ON CONVERT(VARCHAR(18), s.Id) = CONVERT(VARCHAR(18), c.Id)
+     WHERE ISNULL(CONVERT(NVARCHAR(20), c.IsActive_raw), N'') <> ISNULL(CONVERT(NVARCHAR(20), c.IsActive_clean), N'')
+        OR ISNULL(c.Year_raw, N'') <> ISNULL(CONVERT(NVARCHAR(20), c.Year_clean), N'');
 
-```sql
--- unique per Id (inherited from staging)
-SELECT COUNT(*) FROM (SELECT Id FROM staging.campaign_clean GROUP BY Id HAVING COUNT(*)>1) x;
--- no critical-failing Id leaked into clean
-SELECT COUNT(*) FROM staging.campaign_clean c
-WHERE EXISTS (SELECT 1 FROM dq.dq_exceptions e
-              WHERE e.object_name='Campaign' AND e.severity='CRITICAL'
-                AND e.record_id = CONVERT(VARCHAR(18), c.Id));
-```
+     -- What was skipped and why
+     SELECT TOP 20 Id, review_reason FROM clean.campaign WHERE clean_flag = N'REVIEW';
+     ```
+   - **Test & explain (one business-readable summary):** run this single query to show, in one row, how
+     many campaigns were cleaned vs need review, and how many of each field the clean step corrected:
 
-#### Every Campaign rule — business vs technical (pick what to auto-fix)
+     ```sql
+     SELECT
+       COUNT(*)                                                                              AS total_campaigns,
+       SUM(CASE WHEN clean_flag = N'CLEAN'  THEN 1 ELSE 0 END)                                AS ready_no_review,
+       SUM(CASE WHEN clean_flag = N'REVIEW' THEN 1 ELSE 0 END)                                AS needs_review,
+       SUM(CASE WHEN ISNULL(CurrencyIsoCode_raw, N'') <> ISNULL(CurrencyIsoCode_clean, N'') THEN 1 ELSE 0 END) AS currency_fixed,
+       SUM(CASE WHEN ISNULL(Status_raw, N'')          <> ISNULL(Status_clean, N'')          THEN 1 ELSE 0 END) AS status_fixed,
+       SUM(CASE WHEN ISNULL(CONVERT(NVARCHAR(20), IsActive_raw), N'') <> ISNULL(CONVERT(NVARCHAR(20), IsActive_clean), N'') THEN 1 ELSE 0 END) AS isactive_fixed,
+       SUM(CASE WHEN ISNULL(Year_raw, N'')            <> ISNULL(CONVERT(NVARCHAR(20), Year_clean), N'') THEN 1 ELSE 0 END) AS year_fixed
+     FROM clean.campaign;
+     ```
 
-How to read this: **Technical (auto)** = safe, mechanical — apply it on the clean table above. **Business**
-= needs a stakeholder decision — keep report-only or queue as approved writeback, never silently change.
-**Integrity/load** = can't be fixed until related data is loaded. Every rule has a fix recipe even if it
-currently has 0 failures, so it's ready if it ever fails.
+     Read it back to the business like this: *"Of **total_campaigns**, **ready_no_review** are clean and
+     ready; **needs_review** need a human. The step corrected currency on **currency_fixed**, status on
+     **status_fixed**, the active flag on **isactive_fixed**, and filled the year on **year_fixed** — and
+     it changed nothing critical, because the run was blocked unless zero critical issues remained."*
+   - **New behaviour — Status default + business alerts (show the difference & effect):**
 
-| Rule | Sev | Checks | Type | How to fix |
-| --- | --- | --- | --- | --- |
-| CAM-001 | CRITICAL | `Id` not null | Technical (gate) | Can't invent a key — hold the row out of clean and re-extract at source. |
-| CAM-002 | CRITICAL | `Id` is 15/18-char | Technical (gate) | Malformed id = bad extract; re-pull the record. Never auto-edit keys. |
-| CAM-003 | HIGH | `Name` not null | Business | Someone must supply the Name; queue for source correction, no safe default. |
-| CAM-004 | REPORT-ONLY | `Status` value | Technical (case) + Business (value) | Trim/case in clean; unknown values → business maps to canonical (report-only). |
-| CAM-005 | HIGH | `StartDate` ≤ `EndDate` | Business | Which date is wrong is a decision / migration artifact; don't auto-swap — review. |
-| CAM-006 | REPORT-ONLY | `CurrencyIsoCode` value | Technical (case) + Business (value) | Trim/upper in clean; unknown ISO codes → business confirms. |
-| CAM-007 | MEDIUM | `BudgetedCost` ≥ 0 | Business | Coerce non-numeric → NULL (technical); a **negative** budget's meaning is a business call. |
-| CAM-008 | MEDIUM | `AmountWon` ≤ `AmountAll` | Business (SF rollup) | These are Salesforce roll-up fields — fix in Salesforce, not the warehouse. Report only. |
-| CAM-009 | MEDIUM | Completed/Aborted ⇒ `IsActive`=false | Business → writeback | Mechanically set `IsActive`=false to match status, but that's a correction — queue as approved writeback. |
-| CAM-010 | HIGH | `ParentId` exists | Integrity/load | Needs the parent Campaign loaded; if truly missing, business decides orphan vs bad ref. |
-| CAM-011 | LOW | Past `EndDate` ⇒ `IsActive`=false | Business → writeback | Same shape as CAM-009: propose `IsActive`=false for expired; approve before push. |
-| CAM-012 | LOW | `ActualCost` ≤ 200% Budget | Business | Confirm the 200% tolerance; then report-only, no auto-change. |
-| CAM-013 | MEDIUM | Opps ≤ Hierarchy opps | Business (SF rollup) | Salesforce roll-up integrity; fix in Salesforce. Report only. |
-| CAM-014 | LOW | `Casesafe_Campaign_ID__c` == `Id` | Technical (auto) | The 18-char case-safe id is deterministic from the 15-char `Id` — recompute it with a helper. Safe auto-fix. |
-| CAM-015 | LOW | `Year__c` valid 4-digit | Technical / Business | Derive from `YEAR(StartDate)` when blank/invalid (in clean); confirm the rule with business. |
-| CAM-016 | MEDIUM | `Region__c` in list | Business (governed) | Reads `staging.campaign_region_allowed_values`; business owns the list. Report only. |
-| CAM-017 | HIGH | `IsDeleted` boolean token | Technical (auto) | Normalize the token to 0/1 (in clean); deleted rows are already filtered out of staging. |
-| CAM-URL-001 | MEDIUM | `Fundraising_page_url__c` pattern | Business (light technical) | Trimming is safe; adding a scheme or validating a link is a business/data decision — don't rewrite URLs silently. |
+     ```sql
+     -- 1) Status: NULL/blank now defaulted to 'Aborted' (before -> after)
+     SELECT TOP 20 Id, Status_raw AS before_status, Status_clean AS after_status
+     FROM clean.campaign
+     WHERE Status_raw IS NULL OR LTRIM(RTRIM(CONVERT(NVARCHAR(200), Status_raw))) = N'';
 
-**What to apply on the clean table (technical/mechanical only):** CAM-004 (case), CAM-006 (case),
-CAM-015 (Year from StartDate), CAM-017 / `IsActive` (boolean → 0/1), and CAM-014 (recompute case-safe id
-via a helper). **Everything else stays report-only or becomes an approved writeback** — including the
-"clean" rollup/date/threshold rules (CAM-005/007/008/012/013), because their *values* are business
-decisions, not formatting.
+     -- how many campaigns received the 'Aborted' default (the effect)
+     SELECT COUNT(*) AS status_defaulted_to_aborted
+     FROM clean.campaign
+     WHERE (Status_raw IS NULL OR LTRIM(RTRIM(CONVERT(NVARCHAR(200), Status_raw))) = N'')
+       AND Status_clean = N'Aborted';
 
-### Stage 5 — Push-ready / writeback (NOT built yet)
+     -- 2) dq.alert: issues a human must action (currently only CAM-008 won > all)
+     SELECT check_name, severity, cleaned, COUNT(*) AS alerts
+     FROM dq.alert WHERE object_name = 'Campaign'
+     GROUP BY check_name, severity, cleaned;
 
-The two CLEANED columns become the approved corrections queued in `writeback.campaign_pending`
-(`Id`, field, `old value` -> `new value`, rule, status). SKIPPED rows are **not** queued. The push back
-to Salesforce is a separate, approval-gated ADF/Function step (future). `campaign_writeback_queue.sql`
-still needs to be created.
+     -- the actual campaigns flagged, with the offending numbers (Won / All / Excess)
+     SELECT TOP 20 record_id, issue, current_value
+     FROM dq.alert WHERE object_name = 'Campaign' AND check_name = 'CAM-008';
 
-### Production note — container Python vs ADF
+     -- ALL alerts to show the business (every object/check), most campaigns first
+     SELECT object_name, check_name, severity,
+            CASE WHEN cleaned = 1 THEN N'Auto-fixed' ELSE N'Needs a person' END AS action,
+            COUNT(*) AS campaigns
+     FROM dq.alert
+     GROUP BY object_name, check_name, severity, cleaned
+     ORDER BY campaigns DESC;
+     ```
 
-Both ingest paths are proven in Stage 1 (Path A = ADF Copy, Path B = container `python.py`). For
-production the plan runs the container `python.py` under **Apache NiFi** rather than a manually-triggered
-Container App Job; see [azure_migration_plan.md](../../SalesForceDW/docs/azure_migration_plan.md) (§4.2 / §4.3).
+     Read the effect back to the business: *"We defaulted **status_defaulted_to_aborted** campaigns with
+     no status to **Aborted**, and raised **25** campaigns where the 'won' amount exceeds the 'total'
+     amount into the alert list for finance to review — the pipeline did **not** change those numbers."*
+5. Stage 5 Push-ready:
+   - Queue approved corrections in `writeback.campaign_pending`.
+   - Push back to Salesforce remains a separate approved step.
 
-### Run order summary (fully on Azure, portal)
+Do not continue to the next stage until the gate of the current stage passes.
 
-| # | Stage | Where it runs (portal) | Gate |
-| --- | --- | --- | --- |
-| A | Provision | Portal create blades | resources exist |
-| B | Deploy DDL | SQL **Query editor** (or Cloud Shell) | objects exist on Azure SQL |
-| 1 | Ingest | **Path A** ADF `pl_campaign_ingest` **and Path B** container `python.py` job — both into raw | both `Succeeded`, equal raw counts |
-| 2 | Stage | ADF Script activity `EXEC ctl.refresh_latest_views` | 0 duplicate Ids |
-| 3 | Check | ADF Stored Procedure `dq.run_incremental_catalog_rules` | 0 critical |
-| 4 | Clean | ADF Script `campaign_clean_build.sql` (4 mechanical fixes, rest skipped) | unique + no critical leak |
-| 5 | Push-ready | ADF Script `campaign_writeback_queue.sql` (to create) | approved only |
+### Step 5 — Monitor and troubleshoot
 
-Net result: Salesforce -> (ADF Copy **or** container `python.py`) -> Azure SQL (raw -> staging -> dq -> clean) -> writeback
-queue, all orchestrated and monitored in Azure. **Nothing runs on your PC.**
+1. ADF Monitor: check pipeline and activity run status.
+2. Query Editor: verify control tables (`ctl.etl_run_control`, `ctl.watermark_control`).
+3. If needed, use the gate queries from Part C as the final pass/fail source.
 
 ## Part F — Definition Of Done (Campaign POC)
 
@@ -628,7 +835,7 @@ queue, all orchestrated and monitored in Azure. **Nothing runs on your PC.**
   same `raw.salesforce_campaign` with equal counts; Path B also proves Full / Incremental / ResumeMissing.
 - `staging.campaign_latest` has **0 duplicate Ids** and excludes deleted rows.
 - DQ runs incrementally and reports **0 CRITICAL** for the in-scope set.
-- `staging.campaign_clean` exists, is unique per `Id`, and contains **no** critical-failing record.
+- `clean.campaign` exists, is unique per `Id`, and contains **no** critical-failing record.
 - Clean **actually corrects 4 checks** (CAM-006 currency, CAM-004 status case/whitespace, IsActive boolean,
   CAM-015 Year-from-StartDate) and **skips the rest with a recorded reason** — the cleaned/skipped counts
   are visible in the demonstration query.
@@ -646,24 +853,6 @@ Azure services chosen in [azure_migration_plan.md](../../SalesForceDW/docs/azure
 
 ## Part G — Optional Cost Estimate (3-Day POC)
 
-Scenario: **Campaign only** (~41K rows / ~50 MB), UK South, over **3 days** — one **full load**, a few
-**incrementals** per day, running the **rules**, and building the **clean** table. This is a relative
-estimate, **not a quote** — confirm with the Azure Pricing Calculator.
-
-| Service | What drives cost | 3-day estimate |
-| --- | --- | --- |
-| Azure SQL Database (serverless, GP 1 vCore, auto-pause 1h) | vCore-seconds **while active** + ~5 GB storage | ~£4–6 (near £0 while paused) |
-| Azure Data Factory | activity-run count + Copy DIU-hours (tiny dataset) | ~£1–2 |
-| ADLS Gen2 | 50 MB + a few thousand operations | < £0.10 |
-| Key Vault | per-secret operation | < £0.05 |
-| Log Analytics (if enabled for logs) | ingested log volume (small) | < £0.20 |
-| **Total** | | **~£6–10 (~$8–13)** |
-
-Keep it low: leave SQL **auto-pause** on (idles to near-zero), run pipelines **on demand** (not a tight
-schedule), and **delete the resource group** when done. Serverless compute dominates the bill; everything
-else is pennies at this size. Cost scales with the *big* objects later (Opportunity, Item Allocation) —
-not with Campaign.## Part G — Optional Cost Estimate (3-Day POC)
-
 Scenario: **Campaign only** (~41K rows / ~50 MB), over **3 days** — one **full load**, a few
 **incrementals** per day, running the **rules**, and building the **clean** table. Relative estimate in
 **USD**, **not a quote** — confirm with the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
@@ -677,6 +866,20 @@ Scenario: **Campaign only** (~41K rows / ~50 MB), over **3 days** — one **full
 | Log Analytics (if logs enabled) | per **GB ingested** (small) | < $0.25 |
 | **Total** | | **~$8–13** |
 
+### Ingest path cost comparison (Path A vs Path B vs Functions)
+
+Both ingest paths write to the **same** `raw.salesforce_campaign`; only the *runner* differs.
+
+| Path | Per Campaign run | Fixed / idle cost | Verdict |
+| --- | --- | --- | --- |
+| **A — ADF Copy** | ~$0.05–0.10 (4 DIU × few min + activity run) | **$0** (pay-per-run) | **Primary** — cheapest, no code, already built |
+| **B — Container Apps Job** | **<$0.01** (usually inside the free monthly grant → ~$0) | **ACR ~$5/mo** (Basic) — or **$0** via a public Docker Hub repo | Use only to prove Full/Incremental/**ResumeMissing** |
+| **Azure Functions** | ~$0 on Consumption free grant | Premium plan (needed for ODBC + >10 min) **> ACR cost** | **Not used** — native ODBC + 10-min cap force a pricier container-on-Premium setup |
+
+**Decision:** route routine ingest through **Path A**; spin up **Path B** briefly only for the resume
+proof, then **delete its ACR** (and Container Apps env) to drop the fixed cost. The serverless SQL DB
+(on auto-pause) is shared by both paths and dominates the bill regardless of runner.
+
 **Why so low:** serverless SQL auto-pauses (near-$0 idle) and Campaign is tiny, so vCore-seconds and
 DIU-hours are minimal. **Pricing references:**
 [Azure SQL Database serverless](https://azure.microsoft.com/pricing/details/azure-sql-database/single/) ·
@@ -684,3 +887,23 @@ DIU-hours are minimal. **Pricing references:**
 [ADLS Gen2 / Blob](https://azure.microsoft.com/pricing/details/storage/data-lake/) ·
 [Key Vault](https://azure.microsoft.com/pricing/details/key-vault/) ·
 [Azure Monitor / Log Analytics](https://azure.microsoft.com/pricing/details/monitor/).
+
+### How to check the actual bill (Azure Portal)
+
+The table above is an estimate — here is how to see the **real** cost of these POC resources:
+
+1. **Scope to the resource group.** Portal → resource group **`Quality-check-poc`** → **Cost analysis**
+   (under *Cost Management*). This shows only this POC's spend; set the date range to your POC days.
+2. **Group by *Service* or *Resource*** to see which piece costs what (SQL DB vs ADF vs storage); switch
+   the view to *Accumulated cost* for a running total.
+3. **Per-service detail:** the **SQL DB → Overview** shows compute used (serverless bills only while
+   active); **ADF → Monitor → Consumption** on a pipeline run shows its DIU-hours + activity units.
+4. **Set a budget + alert.** Cost Management → **Budgets** → **+ Add** on the RG (e.g. **$20/month**),
+   alert at 80% — it emails you before spend grows. Best safety net for a POC.
+5. **Invoice / export:** **Cost Management + Billing → Invoices** for the billed amount, or **Exports**
+   to drop a daily usage CSV into storage.
+
+Notes: cost data **lags ~8–24 h** (today's runs appear tomorrow); tag resources
+(`Project=Quality-check-poc`) to filter faster; and when finished, **delete the resource group** to stop
+all charges at once. Reference:
+[Analyze costs with Cost analysis](https://learn.microsoft.com/azure/cost-management-billing/costs/quick-acm-cost-analysis).

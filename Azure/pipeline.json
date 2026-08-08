@@ -1,0 +1,198 @@
+{
+    "name": "pl_ingest_campaign",
+    "properties": {
+        "activities": [
+            {
+                "name": "CopyCampaign",
+                "type": "Copy",
+                "dependsOn": [
+                    {
+                        "activity": "StartRun",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "SalesforceV2Source",
+                        "SOQLQuery": {
+                            "value": "@concat('SELECT Id, IsDeleted, Name, ParentId, Type, RecordTypeId, Status, StartDate, EndDate, CurrencyIsoCode, ExpectedRevenue, BudgetedCost, ActualCost, ExpectedResponse, NumberSent, IsActive, Description, CampaignImageId, NumberOfLeads, NumberOfConvertedLeads, NumberOfContacts, NumberOfResponses, NumberOfOpportunities, NumberOfWonOpportunities, AmountAllOpportunities, AmountWonOpportunities, HierarchyNumberOfLeads, HierarchyNumberOfConvertedLeads, HierarchyNumberOfContacts, HierarchyNumberOfResponses, HierarchyNumberOfOpportunities, HierarchyNumberOfWonOpportunities, HierarchyAmountAllOpportunities, HierarchyAmountWonOpportunities, HierarchyNumberSent, HierarchyExpectedRevenue, HierarchyBudgetedCost, HierarchyActualCost, OwnerId, CreatedDate, CreatedById, LastModifiedDate, LastModifiedById, SystemModstamp, LastActivityDate, LastViewedDate, LastReferencedDate, CampaignMemberRecordTypeId, GW_Volunteers__Volunteer_Website_Time_Zone__c, GW_Volunteers__Number_of_Volunteers__c, GW_Volunteers__Volunteer_Completed_Hours__c, GW_Volunteers__Volunteer_Jobs__c, GW_Volunteers__Volunteer_Shifts__c, GW_Volunteers__Volunteers_Still_Needed__c, Money_Saved__c, Campaign_Title__c, Notes__c, Unique_Name__c, Source__c, Department__c, Region__c, Year__c, City_Code__c, City__c, FR_Unique_Number__c, Sub_Region__c, Fundraiser_Code__c, Event_Type_Code__c, Event_Acronym__c, Event_Location_Code__c, Created_Date_Time__c, Casesafe_Campaign_ID__c, Regional_Office_Code__c, Campaign_Location__c, Code__c, Long_Name_Field__c, DMS_Campaign_ID__c, Max_Call_Retry__c, Response_Percentage__c, Retry_Intervals__c, Parent_Campaign_CasesafeID__c, Email_Notification__c, Achieved_Target__c, Description_detail__c, Donor__c, Fundraiser_Person__c, Number_of_attendees__c, Pledged_Amount__c, Remaining_Pledge_Amount__c, Remaining_Target__c, Grandparent_Campaign_Casesafe_Id__c, Dialer_Queue__c, Country__c, Fundraiser__c, Fundraising_page_url__c, Fundraising_Objective_Purpose__c, Fundraising_Team_Code__c, Speaker_Artist__c, Call_List_Clearing_In_Progress__c, Available_Amount__c, Total_Funds_Allocated__c, Upload_Transaction_ID__c, Item__c, Stipulation__c, Donation_Value__c, Patient__c, Donation_Raised__c, Funds_Allocated__c, Total_FundsAllocated__c, Email_Acknowledgement_Status__c, FundraisingCode__c, Priority__c, Reviewed__c, Campaign_Count__c, Page_Type__c, Arrival_Time__c, External_Id__c, Funds_Allocated_In_Campaign_Non_Pledge__c, Funds_Allocated_In_Hierarchy_Instruction__c, Funds_Allocated_In_Hierarchy_Non_Pledge__c, Funds_Allocated_In_Hierarchy_Outside_CRM__c, Income_Stream__c FROM Campaign WHERE SystemModstamp > ', activity('GetWatermark').output.firstRow.wm, ' AND SystemModstamp <= ', activity('StartRun').output.firstRow.run_start)",
+                            "type": "Expression"
+                        },
+                        "includeDeletedObjects": false,
+                        "partitionOption": "None",
+                        "preserveScaleFromSchema": false,
+                        "additionalColumns": [
+                            {
+                                "name": "_etl_run_id",
+                                "value": {
+                                    "value": "@activity('StartRun').output.firstRow.run_id",
+                                    "type": "Expression"
+                                }
+                            },
+                            {
+                                "name": "_etl_extracted_at_utc",
+                                "value": {
+                                    "value": "@utcnow()",
+                                    "type": "Expression"
+                                }
+                            },
+                            {
+                                "name": "_etl_source_object",
+                                "value": "Campaign"
+                            }
+                        ]
+                    },
+                    "sink": {
+                        "type": "AzureSqlSink",
+                        "writeBehavior": "insert",
+                        "sqlWriterUseTableLock": false
+                    },
+                    "enableStaging": false,
+                    "translator": {
+                        "type": "TabularTranslator",
+                        "typeConversion": true,
+                        "typeConversionSettings": {
+                            "allowDataTruncation": true,
+                            "treatBooleanAsNumber": false
+                        }
+                    }
+                },
+                "inputs": [
+                    {
+                        "referenceName": "ds_sf",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_object": "Campaign"
+                        }
+                    }
+                ],
+                "outputs": [
+                    {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "raw",
+                            "p_table": "salesforce_campaign"
+                        }
+                    }
+                ]
+            },
+            {
+                "name": "GetWatermark",
+                "type": "Lookup",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": "SELECT COALESCE(CONVERT(VARCHAR(19), MAX(last_watermark_value), 126) + 'Z', '1900-01-01T00:00:00Z') AS wm\nFROM ctl.watermark_control WHERE object_name = N'Campaign';",
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "ctl",
+                            "p_table": "watermark_control"
+                        }
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "StartRun",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "GetWatermark",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": "DECLARE @now DATETIME2(7) = SYSUTCDATETIME();\nINSERT INTO ctl.etl_run_control (object_name, load_type, start_time, status)\nVALUES (N'Campaign', N'Incremental', @now, N'Running');\nSELECT CAST(SCOPE_IDENTITY() AS BIGINT) AS run_id, CONVERT(VARCHAR(19), @now, 126) + 'Z' AS run_start;",
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "ctl",
+                            "p_table": "etl_run_control"
+                        }
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "FinishRun",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "CopyCampaign",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "ls_sql_salesforcedw_POC",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "UPDATE ctl.etl_run_control\nSET status = N'Succeeded',\n    end_time = SYSUTCDATETIME(),\n    rows_extracted = @{activity('CopyCampaign').output.rowsCopied},\n    rows_loaded    = @{activity('CopyCampaign').output.rowsCopied}\nWHERE run_id = @{activity('StartRun').output.firstRow.run_id};\n\nMERGE ctl.watermark_control AS t\nUSING (SELECT N'Campaign' AS object_name) AS s\nON t.object_name = s.object_name\nWHEN MATCHED THEN UPDATE SET\n    last_watermark_value = CONVERT(DATETIME2(7), '@{activity('StartRun').output.firstRow.run_start}', 127),\n    watermark_column = N'SystemModstamp',\n    last_success_run_id = @{activity('StartRun').output.firstRow.run_id},\n    updated_at = SYSUTCDATETIME()\nWHEN NOT MATCHED THEN INSERT (object_name, watermark_column, last_watermark_value, last_success_run_id, updated_at)\n    VALUES (N'Campaign', N'SystemModstamp', CONVERT(DATETIME2(7), '@{activity('StartRun').output.firstRow.run_start}', 127), @{activity('StartRun').output.firstRow.run_id}, SYSUTCDATETIME());",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00"
+                }
+            }
+        ],
+        "annotations": [],
+        "lastPublishTime": "2026-08-05T06:37:27Z"
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}

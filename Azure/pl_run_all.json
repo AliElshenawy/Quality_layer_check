@@ -1,0 +1,83 @@
+{
+    "name": "pl_run_all",
+    "properties": {
+        "description": "Master: read active objects from ctl.object_registry, then run pl_object_etl once per object. The CASE maps the registry short name to the Salesforce API name (replace with a registry column later).",
+        "activities": [
+            {
+                "name": "LookupObjects",
+                "type": "Lookup",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": "SELECT source_table AS p_raw_table, object_name AS p_short, CASE object_name WHEN 'campaign' THEN 'Campaign' WHEN 'contact' THEN 'Contact' WHEN 'opportunity' THEN 'Opportunity' WHEN 'payment' THEN 'npe01__OppPayment__c' WHEN 'item' THEN 'npsp__General_Accounting_Unit__c' WHEN 'item_allocation' THEN 'npsp__Allocation__c' WHEN 'recurring_donation' THEN 'npe03__Recurring_Donation__c' WHEN 'sponsorship' THEN 'Sponsorship__c' WHEN 'sponsorship_unit' THEN 'Sponsorship_Unit__c' END AS p_object FROM ctl.object_registry WHERE is_active = 1 AND object_name IN ('campaign','contact','opportunity','payment','item','item_allocation','recurring_donation','sponsorship','sponsorship_unit') ORDER BY source_table;",
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_sql",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "p_schema": "ctl",
+                            "p_table": "object_registry"
+                        }
+                    },
+                    "firstRowOnly": false
+                }
+            },
+            {
+                "name": "ForEachObject",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "LookupObjects",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "userProperties": [],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('LookupObjects').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": true,
+                    "activities": [
+                        {
+                            "name": "RunObjectETL",
+                            "type": "ExecutePipeline",
+                            "dependsOn": [],
+                            "policy": {
+                                "secureInput": false
+                            },
+                            "userProperties": [],
+                            "typeProperties": {
+                                "pipeline": {
+                                    "referenceName": "pl_object_etl",
+                                    "type": "PipelineReference"
+                                },
+                                "waitOnCompletion": true,
+                                "parameters": {
+                                    "p_object": "@item().p_object",
+                                    "p_raw_table": "@item().p_raw_table",
+                                    "p_short": "@item().p_short"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "annotations": []
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}

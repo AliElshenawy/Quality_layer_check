@@ -1,0 +1,21 @@
+{
+    "name": "ds_sf",
+    "properties": {
+        "linkedServiceName": {
+            "referenceName": "ls_salesforce_poc",
+            "type": "LinkedServiceReference"
+        },
+        "parameters": {
+            "p_object": {
+                "type": "string"
+            }
+        },
+        "annotations": [],
+        "type": "SalesforceV2Object",
+        "schema": [],
+        "typeProperties": {
+            "objectApiName": "@dataset().p_object"
+        }
+    },
+    "type": "Microsoft.DataFactory/factories/datasets"
+}

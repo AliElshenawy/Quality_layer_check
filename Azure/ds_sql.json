@@ -1,0 +1,24 @@
+{
+    "name": "ds_sql",
+    "properties": {
+        "linkedServiceName": {
+            "referenceName": "ls_sql_salesforcedw_POC",
+            "type": "LinkedServiceReference"
+        },
+        "parameters": {
+            "p_schema": {
+                "type": "string"
+            },
+            "p_table": {
+                "type": "string"
+            }
+        },
+        "annotations": [],
+        "type": "AzureSqlTable",
+        "schema": [],
+        "typeProperties": {
+            "schema": "@dataset().p_schema",
+            "table": "@dataset().p_table"
+        }
+    }
+}
