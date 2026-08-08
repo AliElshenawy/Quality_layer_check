@@ -45,6 +45,8 @@ GO
 :r ctl\watermark_control_table.sql
 :r ctl\loaded_salesforce_item_allocation_ids_table.sql
 :r ctl\loaded_salesforce_opportunity_ids_table.sql
+:r ctl\clean_state_table.sql
+:r ctl\staging_state_table.sql
 
 /* 4) dq tables (dq_rule_catalog before dq_exceptions for the FK) --------- */
 :r dq\dq_rule_catalog_table.sql
@@ -57,7 +59,7 @@ GO
 :r dq\technical_run_table.sql
 :r dq\rule_execution_state_table.sql
 :r dq\rule_execution_audit_table.sql
-:r dq\rule_action_config_table.sql
+:r dq\dq_alert_table.sql
 
 /* 5) staging resume tables ----------------------------------------------- */
 :r staging\salesforce_item_allocation_resume_batch_table.sql
@@ -76,6 +78,21 @@ GO
 :r staging\vw_sponsorship_unit_latest_view.sql
 :r staging\vw_item_latest_view.sql
 
+/* 6b) staging materialized latest tables + incremental builders ---------- */
+:r staging\campaign_latest_table.sql
+:r staging\contact_latest_table.sql
+:r staging\item_gau_latest_table.sql
+:r staging\recurring_donation_latest_table.sql
+:r staging\refresh_object_latest_SP.sql
+:r staging\campaign_latest_SP.sql
+:r staging\contact_latest_SP.sql
+:r staging\item_gau_latest_SP.sql
+:r staging\recurring_donation_latest_SP.sql
+
+/* 6c) clean table (persistent) + incremental build proc ------------------ */
+:r clean\campaign_table.sql
+:r clean\refresh_campaign_SP.sql
+
 /* 7) dq view (depends on dq_rule_catalog + field_mapping) ---------------- */
 :r dq\vw_rule_readiness_view.sql
 
@@ -93,7 +110,15 @@ GO
 :r dq\suggest_field_mappings_SP.sql
 :r dq\prepare_incremental_rule_queue_SP.sql
 :r dq\run_incremental_catalog_rules_SP.sql
-:r dq\apply_rule_updates_SP.sql
+
+/* 9b) pipeline orchestrator (staging -> DQ -> clean; depends on the above) */
+:r ctl\run_object_pipeline_SP.sql
+
+/* 10) mart tables -------------------------------------------------------- */
+:r mart\dim_campaign_table.sql
+
+/* 11) dbo utilities ------------------------------------------------------ */
+:r dbo\usp_null_analysis_SP.sql
 
 PRINT 'SalesforceDW structure deploy complete.';
 GO

@@ -2,6 +2,11 @@
 
 This framework is designed for very large tables where full truncate-and-reload of violation data is expensive. It is driven by a **source watermark** (`SystemModstamp`), not by a pending/done state machine.
 
+> **DQ framework docs — read in this order:** 1) this file (engine design + runbook) →
+> 2) `DQ_framework_review_checklist.md` (pre-deploy checks) → 3) `DQ_sample_data_smart_checks_plan.md`
+> (execution plan) → 4) `null_analysis_raw_layer.md` (profiling basis) →
+> 5) `../DOCS/dq_framework_reference.md` (object map + alert concept + assessment).
+
 ## What this solves
 
 1. New rule added:

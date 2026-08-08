@@ -17,3 +17,5 @@ CREATE SCHEMA [staging]
 GO
 CREATE SCHEMA [writeback]
 GO
+IF SCHEMA_ID(N'clean') IS NULL EXEC (N'CREATE SCHEMA [clean];');
+GO
